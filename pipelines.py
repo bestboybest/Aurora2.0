@@ -1,6 +1,7 @@
 import ee
 import geopandas as gpd
 import pandas as pd
+import rasterio
 import geemap
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -12,6 +13,11 @@ features = ["NDVI", "B11", "B12", "NDVI_median", "B11_median", "B12_median", "BS
 gdf = gpd.read_file("./Mine Polygons/SHP/mines_cils.shp").to_crs("EPSG:4326").reset_index(drop=True)
 gdf["mine_id"] = gdf.index
 gdf = gdf[["mine_id", "area", "perimeter", "geometry"]]
+
+def debug(s2, printS):
+    print(printS)
+    print(s2.size().getInfo())
+    print("\n")
 
 #Removes cloud shadows, cloud medium probability, cloud high probability, thin cirrus and snow/ice via masking
 def mask(image):
@@ -34,9 +40,10 @@ def addSlope(s2, windowSize, band):
     def addSlopeActual(image):
         date = ee.Date(image.get("system:time_start"))
         window = s2.filterDate(date.advance(-windowSize, "day"), date).select(["time", band])
+        count = window.size()
 
-        fit = window.reduce(ee.Reducer.linearFit())
-        slope = fit.select("scale").rename(f"{band}_slope")
+        slope = ee.Image(ee.Algorithms.If(count.gte(2), window.reduce(ee.Reducer.linearFit()).select("scale"), ee.Image.constant(0).mask(ee.Image.constant(0)))).rename(f"{band}_slope")
+
         return image.addBands(slope)
     return addSlopeActual
 
@@ -44,11 +51,13 @@ def addRollingStats(s2, windowSize):
     def addRollingStatsActual(image):
         date = ee.Date(image.get("system:time_start"))
         window = s2.filterDate(date.advance(-windowSize, "day"), date)
+        count = window.size()
 
         medianOnes = window.select(['NDVI', 'B11', 'B12', 'BSI'])
-        ndviVar = window.select('NDVI')
 
-        ndvi_var =  ndviVar.reduce(ee.Reducer.variance()).rename(["NDVI_var"])
+        ndviVar = window.select('NDVI')
+        ndvi_var = ee.Image(ee.Algorithms.If(count.gte(2), ndviVar.reduce(ee.Reducer.variance()), ee.Image.constant(0).mask(ee.Image.constant(0)))).rename("NDVI_var")
+
         median = medianOnes.median().rename(["NDVI_median", "B11_median", "B12_median", "BSI_median"])
 
         return image.addBands([ndvi_var, median])
@@ -101,6 +110,41 @@ def jsonMaker(centroids, labels, exLabel, means, dir):
     with open(dir + "clusterData.json", "w") as f:
         json.dump(metadata, f, indent = 2)
 
+def scaling(means, stds):
+    def scalingActual(image):
+           meanImg = ee.Image.constant(means)
+           stdImg = ee.Image.constant(stds)
+
+           #Applying StandardScaling
+           return image.subtract(meanImg).divide(stdImg)
+    return scalingActual
+
+#calculate distance to a centroid, this is what we have to minimize to find the closest centroid
+def distCentroid(img, centroid):
+    return img.subtract(centroid).pow(2).reduce(ee.Reducer.sum())
+
+def kmeansEE(centroids, clusterLabels):
+    def kmeansEEActual(image):
+        distImgs = [distCentroid(image, ee.Image.constant(c)) for c in centroids]
+
+        stack = ee.Image.cat(distImgs)
+        #Argmin doesnt exist so we negate the array to use argmax instead lmaoo
+        negDistArray = stack.toArray().multiply(-1)
+        clusterId = negDistArray.arrayArgmax().arrayGet([0])
+        
+        clusterIds = [int(k) for k in clusterLabels.keys()]
+        excavatedStat = [clusterLabels[k] for k in clusterLabels.keys()]
+
+        excavated = clusterId.remap(clusterIds, excavatedStat)
+        return excavated.copyProperties(image, ["system:time_start"])
+    return kmeansEEActual
+
+#Once again, we dont have access to skimage inside of EE, so we gotta settle for this 
+def postprocessing(image):
+    opened = image.focalMin(radius = 1, units = "pixels").focalMax(radius = 1, units = "pixels")
+    closed = opened.focalMax(radius = 1, units = "pixels").focalMin(radius = 1, units = "pixels")
+    return closed
+
 #During training, we could skip the first windowsize images, because we need time for the rolling stats to develop
 #Instead also what we could do is calculate stats from start-windowsize, so by the time we reach the start, the stats would have developed
 def trainingStart(startTime, endTime, mineid, windowSize):
@@ -136,7 +180,38 @@ def trainingComplete(mineid, k = 6):
 
     exLabel, means = findExcavated(centroids, metaLabels)  
     jsonMaker(centroids, metaLabels, exLabel, means, mainDir)
+    
+def monitoringStart(startTime, endTime, mineid, windowSize):
+    mainDir = f"./Mine Data/Mine_{mineid}_data/"
+    startTime = ee.Date(startTime)
+    actualStartTime = startTime.advance(-windowSize, "day")
+    mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
 
-def monitoring():
-    pass
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterDate(actualStartTime, endTime).filterBounds(mine).map(mask)
+    s2 = featureEngineering(s2, windowSize).filterDate(startTime, endTime)
 
+#We would like to export into a nice table that we can reclassify like last time, but we would also want to utilize EE for speed and ease
+#We will need the power of EE to do computations to create our excavated binary mask at each time t and stuff
+#So we need to settle for manually applying scaling and clustering through EE on our pixels BEFORE exporting
+    scaler = joblib.load(mainDir + "scaler.pkl")
+    means = scaler.mean_.tolist()
+    stds = scaler.scale_.tolist()
+    eeScaling = scaling(means, stds)
+    s2 = s2.map(eeScaling)
+
+    kmeans = joblib.load(mainDir + "kmeans.pkl")
+    centroids = kmeans.cluster_centers_.tolist()
+    with open(mainDir + "clusterData.json") as f:
+        clusterData = json.load(f)
+    clusterLabels = clusterData["cluster_labels"]
+    exMaskCreate = kmeansEE(centroids, clusterLabels)
+    s2 = s2.map(exMaskCreate)
+
+    s2 = s2.map(postprocessing)
+
+    s2 = s2.sort("system:time_start")
+
+    s2 = s2.toBands().clip(mine)
+
+    task = ee.batch.Export.image.toDrive(image = s2, description = f"mine_{mineid}_excavation", fileNamePrefix = f"mine_{mineid}_excavation", region = mine.geometry(), scale = 10, maxPixels = 1e13)
+    task.start()
