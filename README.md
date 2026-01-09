@@ -10,7 +10,7 @@ The system learns the spectral signature of excavation for each mine individuall
 - Learns excavation signatures from historical data
 - Detects newly excavated pixels over time
 - Produces time-resolved binary excavation masks
-- Is scalable to large mine inventories 
+- Scalable to large mine inventories 
 ---
 ## Inputs
 - Sentinel-2 Level-2A Multispectral Time Series Data obtained from Google Earth Engine
@@ -24,6 +24,16 @@ via Python API to streamline the workflow.
 mining operations)
 - NBR – Normalized Burn Ratio (changes in NBR can indicate surface disturbances)
 - BSI – Bare Soil Index (mining activities expose bare soil, which this index can highlight)
+---
+## Training Pipeline
+- Selection of mine and filtering of data
+- Feature engineering and differentiation between Seasonal changes and Excavation activity
+- K-Means Clustering and Cluster Classification
+- 
+## Monitoring Pipeline
+- Real-time Monitoring and Detection and handling seasonal changes
+- Binary Mask Cleaning and Polygon extraction
+Output Generation with analysis, reporting and violation detection
 ---
 ## Method Summary
 - Filtration of Sentinel-2 images by mine boundaries and cloud-masked using SCL
