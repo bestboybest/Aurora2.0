@@ -5,3 +5,11 @@ Mine Polygons/mine3.geojson
 Mine Polygons/mine4.geojson
 
 __pycache__/
+
+*.tif
+*.pkl
+*.csv
+*.json
+
+Mine Data/
+Mine Polygons/
