@@ -133,28 +133,6 @@ def findExcavated(centroids, labels):
     exLabel = 0 if scores[0] > scores[1] else 1
     return exLabel, scores
 
-def jsonMaker(centroids, labels, exLabel, means, dir):
-    clusterLabels = {}
-    for i in range(len(centroids)):
-        clusterLabels[str(i)] = (1 if labels[i] == exLabel else 0)
-
-    centroidData = {}
-    for i, row in enumerate(centroids):
-        centroidData[str(i)] = {features[j]: float(row[j]) for j in range(len(features))}
-
-    metadata = {
-        "cluster_labels" : clusterLabels, 
-        "centroids" : centroidData, 
-        "metacluster_stats": {
-            "0": { "excavation_score": float(means[0]) },
-            "1": { "excavation_score": float(means[1]) }
-        },
-        "excavated_metacluster" : exLabel
-    }
-
-    with open(dir + "clusterData.json", "w") as f:
-        json.dump(metadata, f, indent = 2)
-
 def scaling(means, stds):
     def scalingActual(image):
            meanImg = ee.Image.constant(means)
@@ -229,7 +207,6 @@ def retrieveDates(bandNames, E):
 
 def confidenceSystem(E, dates, threshold):
     T, H, W = E.shape
-    total_pixels = H * W
 
     confirmed = np.zeros((T, H, W), dtype = np.uint8)
     candidate = np.zeros((T, H, W), dtype = np.uint8)
@@ -239,20 +216,8 @@ def confidenceSystem(E, dates, threshold):
     firstSeen = np.full((H, W), -1, dtype = np.int32)
     confirmedFirstSeen = np.full((H, W), -1, dtype=np.int32)
 
-    spike_limit = 0.20 * total_pixels
-
     for t in range(T):
         Et = E[t].copy()
-
-        if t > 0:
-            confirmed_area = np.count_nonzero(confirmed[t-1])
-            current_raw_area = np.count_nonzero(Et == 1)
-    
-            if confirmed_area > 0:
-                growth = current_raw_area - confirmed_area
-                if growth > spike_limit:
-                    new_growth_mask = (Et == 1) & (confirmed[t-1] == 0)
-                    Et[new_growth_mask] = 0
 
         deltaDays = 0 if t == 0 else (dates[t] - dates[t-1]).days
         prevConfirmed = np.zeros((H, W), dtype = np.uint8) if t == 0 else confirmed[t-1]
@@ -326,7 +291,7 @@ def trainingComplete(mineid, debug = 0, k = 6):
     scaler.fit(df)
     #NBR Slope be going brr, so we apply a hard threshold so the values dont skyrocket
     slope_idx = features.index("NBR_slope")
-    scaler.scale_[slope_idx] = 0.05
+    scaler.scale_[slope_idx] = max(scaler.scale_[slope_idx], 0.05)
     var_idx = features.index("NDVI_var")
     if scaler.scale_[var_idx] < 0.5: 
         scaler.scale_[var_idx] = 1.0
@@ -352,28 +317,54 @@ def trainingComplete(mineid, debug = 0, k = 6):
 
     exLabel, means = findExcavated(centroids, metaLabels)  
 
-    b12_idx = features.index("B12")
-    ndvi_idx = features.index("NDVI")
-    b12_med_idx = features.index("B12_median")
-    ndvi_med_idx = features.index("NDVI_median")
+    b12_idx = features.index("B12_median")
+    bsi_idx = features.index("BSI_median")
+    ndvi_idx = features.index("NDVI_median")
+    ndmi_idx = features.index("NDMI_median")
+
+    valid_indices = [i for i in range(k) if metaLabels[i] == exLabel]
+    cluster_scores = {}
     
-    final_labels = metaLabels.copy()
+    for i in valid_indices:
+        score = (2.0 * centroids[i][b12_idx]) + (1.0 * centroids[i][bsi_idx]) - (0.5 * centroids[i][ndvi_idx]) - (1.0 * centroids[i][ndmi_idx])
+        cluster_scores[i] = score
 
+    leader_idx = max(cluster_scores, key=cluster_scores.get)
+    leader_score = cluster_scores[leader_idx]
+
+    final_labels = []
+    
     for i in range(k):
+        is_mine = False
+        
         if metaLabels[i] == exLabel:
-            
-            current_score = centroids[i][b12_idx] - centroids[i][ndvi_idx]
-            
-            median_score = centroids[i][b12_med_idx] - centroids[i][ndvi_med_idx]
+            current_score = cluster_scores[i]
 
-            was_nature = median_score < -0.2 
-            is_weak = current_score < 0.6
-            
-            if was_nature or is_weak:
-                print(f"PRUNING CLUSTER {i}: Identified as Misclassification (Hist: {median_score:.2f}, Curr: {current_score:.2f}) -> FLIPPED TO SAFE")
-                final_labels[i] = 1 - exLabel 
+            if i == leader_idx:
+                is_mine = True
+            elif current_score > (leader_score * 0.60):
+                is_mine = True
+                
+            if current_score < 0.5: is_mine = False
+            if centroids[i][ndvi_idx] > 0.5: is_mine = False
 
-    jsonMaker(centroids, final_labels, exLabel, means, mainDir)
+            if not is_mine:
+                print(f"PRUNING CLUSTER {i} -> FLIPPED TO SAFE")
+
+        final_labels.append(1 if is_mine else 0)
+
+    metadata = {
+        "cluster_labels": {str(i): final_labels[i] for i in range(k)},
+        "centroids": {str(i): {features[j]: float(centroids[i][j]) for j in range(len(features))} for i in range(k)},
+        "excavated_metacluster": int(exLabel), 
+        "metacluster_stats": {
+            "0": {"excavation_score": float(means[0])}, 
+            "1": {"excavation_score": float(means[1])}
+        }
+    }
+
+    with open(mainDir + "clusterData.json", "w") as f:
+        json.dump(metadata, f, indent=2)
     
 def monitoringStart(startTime, endTime, mineid, windowSize, debug = 0):
     mainDir = f"./Mine Data/Mine_{mineid}_data/"
@@ -466,95 +457,3 @@ def monitoringComplete(mineid, threshold, debug = 0, nogo = None):
 
     for i in [int(round(p/100 * (len(dates)-1))) for p in [0, 20, 40, 60, 80, 100]]:
         debugCluster(mineid, i, dates, Efixed)
-
-def scanForActivity(mine_ids, reference_mine_id):
-    mainDir = f"./Mine Data/Mine_{reference_mine_id}_data/"
-
-    scaler = joblib.load(mainDir + "scaler.pkl")
-    means = scaler.center_.tolist()
-    stds = scaler.scale_.copy()
-    stds[stds == 0] = 1.0
-    stds = stds.tolist()
-
-    kmeans = joblib.load(mainDir + "kmeans.pkl")
-    centroids = kmeans.cluster_centers_.tolist()
-
-    with open(mainDir + "clusterData.json") as f:
-        clusterData = json.load(f)
-    clusterLabels = clusterData["cluster_labels"]
-
-    target_mines = gdf[gdf["mine_id"].isin(mine_ids)]
-    ee_mines = geemap.geopandas_to_ee(target_mines)
-
-    combined_bounds = ee_mines.geometry()
-
-    def get_classified_area_image(year_start, year_end, output_name):
-        start_date = ee.Date(year_start)
-        end_date = ee.Date(year_end)
-        buffer_start = start_date.advance(-65, "day")
-
-        s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-              .filterDate(buffer_start, end_date)
-              .filterBounds(combined_bounds)
-              .map(mask))
-
-        s2_features = featureEngineering(s2, windowSize=60)
-        
-        composite = (s2_features
-                     .filterDate(start_date, end_date)
-                     .median()
-                     .unmask(0)
-                     .toFloat())
-        
-        scaled = scaling(means, stds)(composite)
-        classified = ee.Image(kmeansEE(centroids, clusterLabels)(scaled))
-        cleaned = postprocessing(classified)
-
-        return cleaned.eq(1).multiply(ee.Image.pixelArea()).rename(output_name)
-
-    img_2022 = get_classified_area_image("2022-01-01", "2022-12-31", "area_2022_m2")
-    
-    img_2024 = get_classified_area_image("2024-01-01", "2024-12-31", "area_2024_m2")
-
-    combined_img = img_2022.addBands(img_2024)
-
-    stats = combined_img.reduceRegions(
-        collection=ee_mines,
-        reducer=ee.Reducer.sum(),
-        scale=30,
-        tileScale=16  
-    )
-
-    def compute_growth(feature):
-        a22 = ee.Number(feature.get("area_2022_m2"))
-        a24 = ee.Number(feature.get("area_2024_m2"))
-        
-        growth_m2 = a24.subtract(a22)
-        
-        growth_pct = ee.Algorithms.If(
-            a22.gt(0),
-            growth_m2.divide(a22).multiply(100),
-            0
-        )
-        
-        status = ee.Algorithms.If(growth_m2.gt(5000), "ACTIVE", "INACTIVE")
-        
-        return feature.set({
-            "growth_m2": growth_m2,
-            "growth_pct": growth_pct,
-            "status": status
-        })
-
-    final_results = stats.map(compute_growth)
-
-    task = ee.batch.Export.table.toDrive(
-        collection=final_results,
-        description=f"MineActivityScan_Ref_{reference_mine_id}",
-        fileFormat="CSV",
-        selectors=[
-            "mine_id", "status", "growth_m2", "growth_pct", 
-            "area_2022_m2", "area_2024_m2"
-        ]
-    )
-
-    task.start()
