@@ -23,7 +23,7 @@ def debug(s2, printS):
     print(s2.size().getInfo())
     print("\n")
 
-def debug2(Efixed, dates):
+def debug2(Efixed, dates):  
     print("Efixed shape:", Efixed.shape)
     print("Efixed dtype:", Efixed.dtype)
 
@@ -120,7 +120,7 @@ def findExcavated(centroids, labels):
         
         if len(group_indices) == 0:
             scores.append(-np.inf)
-            continue
+            continue    
 
         mean_b12 = np.mean([centroids[i][b12_idx] for i in group_indices])
         mean_bsi = np.mean([centroids[i][bsi_idx] for i in group_indices])
