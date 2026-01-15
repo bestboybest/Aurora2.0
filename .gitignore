@@ -9,6 +9,5 @@ __pycache__/
 *.tif
 *.pkl
 *.csv
-*.json
 
 !Mine Data/**/Outputs/*.csv
