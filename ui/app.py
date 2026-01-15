@@ -96,6 +96,40 @@ with tab1:
     else:
         st.success(f"Found {len(images)} images")
 
+        #SORT IMAGES FOR UI (ALL MINES)
+        import os
+
+        def sort_images_for_ui(images):
+            suffix_order = [
+                "spatialMap_0percent",
+                "spatialMap_25percent",
+                "spatialMap_50percent",
+                "spatialMap_75percent",
+                "spatialMap_100percent",
+                "AreavsTime",
+                "NormalizedExcavation",
+                "GrowthRate",
+                "CandidateAreavsTime",
+                "ComparisionPlot",
+                "excavationProgress",
+                "FirstSeenPlot",
+                "NoGo_Excavation_vs_Time",
+            ]
+            suffix_rank = {s: i for i, s in enumerate(suffix_order)}
+
+            def get_suffix(fname):
+                base = os.path.splitext(fname)[0]
+                parts = base.split("_", 2)      # mine, id, suffix
+                return parts[2] if len(parts) >= 3 else base
+
+            return sorted(images, key=lambda x: suffix_rank.get(get_suffix(x), 10**9))
+
+        images = sort_images_for_ui(images)
+
+        #keep index valid after sorting
+        if "img_idx" in st.session_state:
+            st.session_state.img_idx %= len(images)
+
         #Keep current index across reruns
         if "img_idx" not in st.session_state:
             st.session_state.img_idx = 0
@@ -115,12 +149,14 @@ with tab1:
         img = images[st.session_state.img_idx]
         path = os.path.join(out_dir, img)
 
-        st.markdown(f"### {img}")
+        #heading
+        st.markdown(f"### {os.path.splitext(img)[0]}")
         st.caption(
             f"Image {st.session_state.img_idx + 1} / {len(images)} | "
             f"Size: {pretty_file_size(path)}"
         )
         st.image(path, use_container_width=True)
+
 
 #CSV Tab
 with tab2:
