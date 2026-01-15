@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "nogozones",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 81.40814, 24.378737 ], [ 81.407561, 24.378165 ], [ 81.408022, 24.377682 ], [ 81.408634, 24.37817 ], [ 81.40814, 24.378737 ] ] ] } }
+]
+}

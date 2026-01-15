@@ -9,6 +9,7 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.cluster import KMeans
 import joblib
 import json
+import os
 
 from outputs import *
 
@@ -266,6 +267,17 @@ def retroConfirm(confirmed, firstSeen):
     
     return retroConfirmed
 
+def loadNogo(mineid, crs = None):
+    path = f"./Mine Data/Mine_{mineid}_Data/nogozones.geojson"
+    if not os.path.exists(path):
+        return None
+
+    nogo = gpd.read_file(path)
+    if crs is not None:
+        nogo = nogo.to_crs(crs)
+
+    return nogo
+
 #During training, we could skip the first windowsize images, because we need time for the rolling stats to develop
 #Instead also what we could do is calculate stats from start-windowsize, so by the time we reach the start, the stats would have developed
 def trainingStart(startTime, endTime, mineid, windowSize, debug = 0):
@@ -404,7 +416,7 @@ def monitoringStart(startTime, endTime, mineid, windowSize, debug = 0):
     task = ee.batch.Export.image.toDrive(image = s2, description = f"mine_{mineid}_excavation_{debug}", fileNamePrefix = f"mine_{mineid}_excavation_{debug}", region = mine.geometry(), scale = 10, maxPixels = 1e13)
     task.start()
 
-def monitoringComplete(mineid, threshold, debug = 0, nogo = None):
+def monitoringComplete(mineid, threshold, debug = 0):
     mainDir = f"./Mine Data/Mine_{mineid}_data/"
     outDir = f"./Mine Data/Mine_{mineid}_data/Outputs/"
 
@@ -434,6 +446,7 @@ def monitoringComplete(mineid, threshold, debug = 0, nogo = None):
         all_E.append(Efixed)
         all_dates.extend(dates)
 
+    nogo = loadNogo(mineid, crs)
     Efixed = np.concatenate(all_E, axis=0)
 
     sort_idx = np.argsort(all_dates)

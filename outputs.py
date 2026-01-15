@@ -115,6 +115,7 @@ def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, c
 
         gdf[gdf["mine_id"] == mineid].boundary.plot(ax=ax1, edgecolor="black", linewidth=2)
         if nogo is not None:
+            nogo = nogo.to_crs("EPSG:4326")
             nogo.boundary.plot(ax=ax1, edgecolor="yellow", linewidth=2, linestyle="--")
 
         ax1.set_title(f"Retroconfirmed Excavated Area – {dates[t].isoformat()}", fontdict=titleFont)
@@ -178,6 +179,7 @@ def retroConfirmedAnalysis(mineid, dates, dir, retroConfirmed, transform, crs, n
         minegdf.boundary.plot(ax=ax, edgecolor="black", linewidth=2)
 
         if nogo is not None:
+            nogo = nogo.to_crs("EPSG:4326")
             nogo.boundary.plot(ax=ax, edgecolor="yellow", linewidth=2, linestyle="--")
 
         ax.set_title(f"{p} percentile\n{date.isoformat()}", fontdict=titleFont)
@@ -440,8 +442,6 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
     nogo = nogo.to_crs(crs)
     nogo_mask = rasterize_nogo(nogo, (H, W), transform)
 
-    prev_confirmed_area = 0
-
     with open(alert_path, "a") as log:
         for t in range(len(dates)):
             date = dates[t]
@@ -479,15 +479,25 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
                         f"Affected area: {area:.1f} m²\n\n"
                     )
 
-            if conf_pixels > prev_confirmed_area + expansion_threshold_pixels:
-                delta_area = (conf_pixels - prev_confirmed_area) * pixel_area_m2
+            # --- LEVEL 3: sustained expansion over time window ---
+            window_days = 60
+
+            window_start = t
+            while window_start > 0 and (dates[t] - dates[window_start]).days < window_days:
+                window_start -= 1
+
+            prev_conf_mask = (confirmed[window_start] == 1) & nogo_mask
+            prev_conf_pixels = np.count_nonzero(prev_conf_mask)
+
+            if conf_pixels > prev_conf_pixels + expansion_threshold_pixels:
+                delta_pixels = conf_pixels - prev_conf_pixels
+                delta_area = delta_pixels * pixel_area_m2
+
                 log.write(
                     f"[{date}] | Mine {mineid} | LEVEL 3 | VIOLATION EXPANSION\n"
-                    f"Confirmed excavation expanding inside no-go zone.\n"
-                    f"Newly added area: {delta_area:.1f} m²\n\n"
+                    f"Sustained expansion of confirmed excavation inside no-go zone.\n"
+                    f"Added area over last {window_days} days: {delta_area:.1f} m²\n\n"
                 )
-
-            prev_confirmed_area = conf_pixels
 
 def NoGoExcavationTimePlot(mineid, outDir, dates, candidate, confirmed, transform,crs, nogo=None):
     if nogo is None:
