@@ -24,7 +24,7 @@ The pipeline is fully unsupervised and learns excavation signatures independentl
 - `pipelines.py` – Core logic for training (clustering) and monitoring (inference).
 - `outputs.py` – Visualization generation, plotting, and alert system logic.
 - `dashboard.py` – Interactive Streamlit UI code.
-- `NoGo_Creation.ipynb` – Notebook for interactively drawing restricted zones.
+- `testCode.ipynb` – Notebook for interactively drawing restricted zones.
 - `Mine_Data/` – (User Created) Directory storing per-mine data, trained models (`.pkl`), and outputs.
 
 ---
@@ -114,7 +114,7 @@ AURORA 2.0 includes a Streamlit-based dashboard to visualize results without tou
 1.  Open your terminal.
 2.  Navigate to the project root.
 3.  Run the following command:
-    streamlit run python -m streamlit run ui/app.py
+    python -m streamlit run ui/app.py
 
 **Features:**
 - **Mine Selector:** Automatically detects all available mine folders in `Mine Data/`.
