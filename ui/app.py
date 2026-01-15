@@ -229,10 +229,9 @@ with tab2:
 #Alert Logs Tab
 with tab3:
     st.subheader("Alert Logs")
-    st.caption(f"Expected file: `{alert_log}`")
     
     if not os.path.exists(alert_log):
-        st.warning(f"Alert log file not found: `mine_{mine_id}_alerts.log`")
+        st.warning(f"Alert log file not found.")
         st.info("No alerts recorded for this mine.")
     else:
         # Show file info
