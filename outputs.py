@@ -12,25 +12,36 @@ from PIL import Image
 import urllib.request
 import io
 
+# Load mine boundary polygons (used only for visualization + area calculations)
 gdf = gpd.read_file("./Mine Polygons/SHP/mines_cils.shp").to_crs("EPSG:4326").reset_index(drop=True)
 gdf["mine_id"] = gdf.index
 gdf = gdf[["mine_id", "area", "perimeter", "geometry"]]
 
+# Shared font styles for all plots (purely cosmetic)
 titleFont = {'weight':'bold', 'color':'orangered', 'size':20, 'name':'Comic Sans MS'}
 normalFont = {'color':'maroon', 'size':16}
 
+# -------------------------------------------------------------------
+# Converts a binary raster mask into vector polygons.
+# Only pixels with value == 1 (excavated) are polygonized.
+# Used for overlaying excavation boundaries on RGB imagery.
+# -------------------------------------------------------------------
 def polygonize(mask, transform, crs):
     geometries = []
     values = []
 
-    for geom, value in shapes(mask.astype(np.uint8), transform = transform):
+    for geom, value in shapes(mask.astype(np.uint8), transform=transform):
         if value == 1:
             geometries.append(shape(geom))
             values.append(value)
     
-    exgdf = gpd.GeoDataFrame({"value" : values}, geometry = geometries, crs = crs)
+    exgdf = gpd.GeoDataFrame({"value": values}, geometry=geometries, crs=crs)
     return exgdf
 
+# -------------------------------------------------------------------
+# Fetches a quick-look RGB image from Earth Engine as a NumPy array.
+# Used only for visualization (not analysis).
+# -------------------------------------------------------------------
 def eeToNumpy(image, region, vis, size=1024):
     url = image.getThumbURL({
         "region": region,
@@ -42,28 +53,47 @@ def eeToNumpy(image, region, vis, size=1024):
     with urllib.request.urlopen(url) as response:
         img = Image.open(io.BytesIO(response.read()))
         return np.array(img)
-    
-def rasterize_nogo(nogo_gdf, shape, transform):
 
+# -------------------------------------------------------------------
+# Rasterizes a no-go polygon into a boolean mask aligned to a raster.
+# True  -> inside no-go zone
+# False -> outside
+# -------------------------------------------------------------------
+def rasterize_nogo(nogo_gdf, shape, transform):
     return geometry_mask(
         nogo_gdf.geometry,
         out_shape=shape,
         transform=transform,
         invert=True
     )
-    
+
+# -------------------------------------------------------------------
+# Debug visualization:
+# Shows RGB Sentinel-2 image alongside the raw excavation mask
+# at a specific timestep.
+# -------------------------------------------------------------------
 def debugCluster(mineid, t, dates, E):
     eeDate = ee.Date(dates[t].isoformat())
     mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
-    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(mine).filterDate(eeDate.advance(-10, "day"), eeDate.advance(10, "day")).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70)).median().clip(mine))
 
-    rgb = eeToNumpy( s2,region=mine.geometry(), vis={"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000} )
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(mine)
+        .filterDate(eeDate.advance(-10, "day"), eeDate.advance(10, "day"))
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+        .median()
+        .clip(mine)
+    )
 
-    # --- Raw excavation mask ---
-    raw_exc = E[t]
-    raw_exc = np.ma.masked_where(raw_exc != 1, raw_exc)
+    rgb = eeToNumpy(
+        s2,
+        region=mine.geometry(),
+        vis={"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000}
+    )
 
-    # --- Plot ---
+    # Mask non-excavated pixels for clarity
+    raw_exc = np.ma.masked_where(E[t] != 1, E[t])
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     minx, miny, maxx, maxy = gdf[gdf["mine_id"] == mineid].total_bounds
@@ -82,7 +112,13 @@ def debugCluster(mineid, t, dates, E):
     plt.tight_layout()
     plt.show()
 
-def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, crs, nogo = None):
+# -------------------------------------------------------------------
+# Generates paired spatial maps:
+# 1) RGB image + excavation boundary
+# 2) Pixel-wise excavation confidence map
+# Shown at representative percentiles of the timeline.
+# -------------------------------------------------------------------
+def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, crs, nogo=None):
     T = len(dates)
 
     percentiles = [0, 25, 50, 75, 100]
@@ -96,24 +132,38 @@ def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, c
     for i, (t, p) in enumerate(zip(t_idxs, percentiles)):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
+        # Fetch background RGB imagery
         mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
         eeDate = ee.Date(dates[t].isoformat())
-        s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(mine).filterDate(eeDate.advance(-10, "day"), eeDate.advance(10, "day")).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70)).median().clip(mine))
+        s2 = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(mine)
+            .filterDate(eeDate.advance(-10, "day"), eeDate.advance(10, "day"))
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+            .median()
+            .clip(mine)
+        )
 
-        rgb = eeToNumpy(s2,region=mine.geometry(),vis={"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000})
+        rgb = eeToNumpy(
+            s2,
+            region=mine.geometry(),
+            vis={"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000}
+        )
 
         minx, miny, maxx, maxy = gdf[gdf["mine_id"] == mineid].total_bounds
         extent = [minx, maxx, miny, maxy]
-        ax1.set_xlim(minx, maxx)
-        ax1.set_ylim(miny, maxy)
-        ax1.imshow(rgb, extent=extent, origin="upper", interpolation="nearest", vmin=0, vmax=255, alpha=0.85)
+
+        ax1.imshow(rgb, extent=extent, origin="upper", alpha=0.85)
         ax1.set_aspect("equal")
 
+        # Overlay excavation boundary
         poly = retroPolys[i].to_crs("EPSG:4326")
         if not poly.empty and poly.is_valid.any():
             poly.boundary.plot(ax=ax1, edgecolor="cyan", linewidth=2, zorder=10)
 
         gdf[gdf["mine_id"] == mineid].boundary.plot(ax=ax1, edgecolor="black", linewidth=2)
+
+        # Overlay no-go zone if present
         if nogo is not None:
             nogo = nogo.to_crs("EPSG:4326")
             nogo.boundary.plot(ax=ax1, edgecolor="yellow", linewidth=2, linestyle="--")
@@ -121,17 +171,32 @@ def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, c
         ax1.set_title(f"Retroconfirmed Excavated Area – {dates[t].isoformat()}", fontdict=titleFont)
         ax1.axis("off")
 
+        # --- Confidence heatmap ---
         conf = confidence[t]
         conf_masked = np.ma.masked_where(conf == 0, conf)
+
         minegdf = gdf[gdf["mine_id"] == mineid].to_crs(crs)
         H, W = conf_masked.shape
         bounds = array_bounds(H, W, transform)
-        bounds = [bounds[0], bounds[2], bounds[1], bounds[3]]
+        extent = [bounds[0], bounds[2], bounds[1], bounds[3]]
 
-        mine_mask = geometry_mask(minegdf.geometry,out_shape=conf_masked.shape, transform=transform, invert=True)
+        mine_mask = geometry_mask(
+            minegdf.geometry,
+            out_shape=conf_masked.shape,
+            transform=transform,
+            invert=True
+        )
+
         conf_vis = np.ma.masked_where(~mine_mask, conf_masked)
 
-        im = ax2.imshow(conf_vis, cmap="RdYlGn_r", vmin=0, vmax=1, interpolation="nearest", aspect="equal", extent=bounds,origin="upper" )
+        im = ax2.imshow(
+            conf_vis,
+            cmap="RdYlGn_r",
+            vmin=0,
+            vmax=1,
+            extent=extent,
+            origin="upper"
+        )
 
         ax2.set_title(f"Confidence on Excavation – {dates[t].isoformat()}", fontdict=titleFont)
         minegdf.boundary.plot(ax=ax2, edgecolor="black", linewidth=2)
@@ -139,19 +204,23 @@ def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, c
         plt.colorbar(im, ax=ax2, fraction=0.046)
 
         plt.savefig(
-    dir + f"mine_{mineid}_spatialMap_{p}percent.png",
-    dpi=300,
-    bbox_inches="tight",
-    pad_inches=0.2
-)
+            dir + f"mine_{mineid}_spatialMap_{p}percent.png",
+            dpi=300,
+            bbox_inches="tight",
+            pad_inches=0.2
+        )
         plt.close()
 
-
-def retroConfirmedAnalysis(mineid, dates, dir, retroConfirmed, transform, crs, nogo = None):
+# -------------------------------------------------------------------
+# Creates a grid of spatial snapshots (0–100% timeline)
+# showing how excavation evolves over time.
+# This is a compact visual summary of progression.
+# -------------------------------------------------------------------
+def retroConfirmedAnalysis(mineid, dates, dir, retroConfirmed, transform, crs, nogo=None):
     T = len(dates)
 
-    percentiles = list(range(0, 101, 10))  # 0,10,20,...,100
-    t_idxs = [int(round(p/100 * (T-1))) for p in percentiles]
+    percentiles = list(range(0, 101, 10))  # evenly spaced timeline snapshots
+    t_idxs = [int(round(p / 100 * (T - 1))) for p in percentiles]
 
     minegdf = gdf[gdf["mine_id"] == mineid]
     mine = geemap.geopandas_to_ee(minegdf)
@@ -165,19 +234,33 @@ def retroConfirmedAnalysis(mineid, dates, dir, retroConfirmed, transform, crs, n
     for ax, t, p in zip(axes, t_idxs, percentiles):
         date = dates[t]
 
+        # Background RGB imagery
         eeDate = ee.Date(date.isoformat())
-        s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(mine).filterDate(eeDate.advance(-10, "day"), eeDate.advance(10, "day")).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70)).median().clip(mine))
+        s2 = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(mine)
+            .filterDate(eeDate.advance(-10, "day"), eeDate.advance(10, "day"))
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+            .median()
+            .clip(mine)
+        )
 
-        rgb = eeToNumpy(s2,region=mine.geometry(),vis={"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000})
+        rgb = eeToNumpy(
+            s2,
+            region=mine.geometry(),
+            vis={"bands": ["B4", "B3", "B2"], "min": 0, "max": 3000}
+        )
 
-        ax.imshow(rgb, extent=extent, origin="upper", interpolation="nearest", alpha=0.85)
+        ax.imshow(rgb, extent=extent, origin="upper", alpha=0.85)
 
+        # Overlay excavation boundary
         poly = polygonize(retroConfirmed[t], transform, crs).to_crs("EPSG:4326")
         if not poly.empty and poly.is_valid.any():
             poly.boundary.plot(ax=ax, edgecolor="cyan", linewidth=2, zorder=10)
 
         minegdf.boundary.plot(ax=ax, edgecolor="black", linewidth=2)
 
+        # Optional no-go zone overlay
         if nogo is not None:
             nogo = nogo.to_crs("EPSG:4326")
             nogo.boundary.plot(ax=ax, edgecolor="yellow", linewidth=2, linestyle="--")
@@ -188,6 +271,7 @@ def retroConfirmedAnalysis(mineid, dates, dir, retroConfirmed, transform, crs, n
         ax.set_aspect("equal")
         ax.axis("off")
 
+    # Hide unused subplots if any
     for ax in axes[len(percentiles):]:
         ax.axis("off")
 
@@ -195,36 +279,33 @@ def retroConfirmedAnalysis(mineid, dates, dir, retroConfirmed, transform, crs, n
     plt.savefig(dir + f"mine_{mineid}_excavationProgress.png", dpi=300)
     plt.close()
 
+# -------------------------------------------------------------------
+# Computes total retroconfirmed excavated area over time.
+# Used for long-term trend analysis.
+# -------------------------------------------------------------------
 def ExcavationTimePlot(mineid, dir, retroConfirmed, dates, transform):
     pixel_area_m2 = abs(transform.a * transform.e)
 
     areas = []
     for t in range(len(dates)):
         excavated_pixels = np.count_nonzero(retroConfirmed[t] == 1)
-        area = excavated_pixels * pixel_area_m2
-        areas.append(area)
+        areas.append(excavated_pixels * pixel_area_m2)
 
-    df = pd.DataFrame({"date": pd.to_datetime(dates),"excavated_area_m2": areas})
+    df = pd.DataFrame({
+        "date": pd.to_datetime(dates),
+        "excavated_area_m2": areas
+    })
 
     fig, ax = plt.subplots(figsize=(12, 5))
-
-    ax.plot(
-        df["date"],
-        df["excavated_area_m2"],
-        linewidth=2
-    )
+    ax.plot(df["date"], df["excavated_area_m2"], linewidth=2)
 
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-
     ax.xaxis.set_minor_locator(mdates.MonthLocator(interval=6))
 
     ax.set_xlabel("Year", fontdict=normalFont)
     ax.set_ylabel("Excavated Area (m²)", fontdict=normalFont)
-    ax.set_title(
-        "Retroconfirmed Excavated Area vs Time (2018–2025)",
-        fontdict=titleFont
-    )
+    ax.set_title("Retroconfirmed Excavated Area vs Time (2018–2025)", fontdict=titleFont)
 
     ax.grid(True, which="major", alpha=0.4)
     ax.grid(True, which="minor", alpha=0.15)
@@ -235,14 +316,17 @@ def ExcavationTimePlot(mineid, dir, retroConfirmed, dates, transform):
 
     return df
 
+# -------------------------------------------------------------------
+# Same as above, but for *candidate* (unconfirmed) excavation.
+# Shows early signals before confirmation.
+# -------------------------------------------------------------------
 def CandidateExcavationTimePlot(mineid, dir, candidate, dates, transform):
     pixel_area_m2 = abs(transform.a * transform.e)
 
     areas = []
     for t in range(len(dates)):
         candidate_pixels = np.count_nonzero(candidate[t] == 1)
-        area = candidate_pixels * pixel_area_m2
-        areas.append(area)
+        areas.append(candidate_pixels * pixel_area_m2)
 
     df = pd.DataFrame({
         "date": pd.to_datetime(dates),
@@ -250,13 +334,7 @@ def CandidateExcavationTimePlot(mineid, dir, candidate, dates, transform):
     })
 
     fig, ax = plt.subplots(figsize=(12, 5))
-
-    ax.plot(
-        df["date"],
-        df["candidate_excavated_area_m2"],
-        linewidth=2,
-        color="orange"
-    )
+    ax.plot(df["date"], df["candidate_excavated_area_m2"], linewidth=2, color="orange")
 
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -264,7 +342,7 @@ def CandidateExcavationTimePlot(mineid, dir, candidate, dates, transform):
 
     ax.set_xlabel("Year", fontdict=normalFont)
     ax.set_ylabel("Candidate Excavated Area (m²)", fontdict=normalFont)
-    ax.set_title("Candidate Excavated Area vs Time (Unconfirmed Signals)",fontdict=titleFont)
+    ax.set_title("Candidate Excavated Area vs Time (Unconfirmed Signals)", fontdict=titleFont)
 
     ax.grid(True, which="major", alpha=0.4)
     ax.grid(True, which="minor", alpha=0.15)
@@ -275,6 +353,10 @@ def CandidateExcavationTimePlot(mineid, dir, candidate, dates, transform):
 
     return df
 
+# -------------------------------------------------------------------
+# Computes excavation growth rate (m²/day).
+# Highlights acceleration or slowdown phases.
+# -------------------------------------------------------------------
 def GrowthRatePlot(mineid, dir, retroConfirmed, dates, transform):
     pixel_area_m2 = abs(transform.a * transform.e)
 
@@ -285,11 +367,8 @@ def GrowthRatePlot(mineid, dir, retroConfirmed, dates, transform):
 
     rates = [0.0]
     for i in range(1, len(areas)):
-        delta_days = (dates[i] - dates[i-1]).days
-        if delta_days == 0:
-            rates.append(0.0)
-        else:
-            rates.append((areas[i] - areas[i-1]) / delta_days)
+        delta_days = (dates[i] - dates[i - 1]).days
+        rates.append(0.0 if delta_days == 0 else (areas[i] - areas[i - 1]) / delta_days)
 
     df = pd.DataFrame({
         "date": pd.to_datetime(dates),
@@ -297,9 +376,7 @@ def GrowthRatePlot(mineid, dir, retroConfirmed, dates, transform):
     })
 
     fig, ax = plt.subplots(figsize=(12, 5))
-
     ax.plot(df["date"], df["growth_rate_m2_per_day"], linewidth=2, color="purple")
-
     ax.axhline(0, color="black", linewidth=1, alpha=0.6)
 
     ax.xaxis.set_major_locator(mdates.YearLocator())
@@ -319,13 +396,30 @@ def GrowthRatePlot(mineid, dir, retroConfirmed, dates, transform):
 
     return df
 
+# -------------------------------------------------------------------
+# Side-by-side comparison of candidate vs retroconfirmed excavation.
+# This explicitly shows how noisy early signals stabilize over time.
+# -------------------------------------------------------------------
 def ComparisionPlot(mineid, dir, retro_df, candidate_df):
 
     fig, ax = plt.subplots(figsize=(12, 5))
 
-    ax.plot(retro_df["date"], retro_df["excavated_area_m2"],linewidth=3,color="tab:blue",label="Retroconfirmed Excavation")
+    ax.plot(
+        retro_df["date"],
+        retro_df["excavated_area_m2"],
+        linewidth=3,
+        color="tab:blue",
+        label="Retroconfirmed Excavation"
+    )
 
-    ax.plot(candidate_df["date"],candidate_df["candidate_excavated_area_m2"],linewidth=2,linestyle="--",color="tab:orange", label="Candidate Excavation")
+    ax.plot(
+        candidate_df["date"],
+        candidate_df["candidate_excavated_area_m2"],
+        linewidth=2,
+        linestyle="--",
+        color="tab:orange",
+        label="Candidate Excavation"
+    )
 
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -333,27 +427,37 @@ def ComparisionPlot(mineid, dir, retro_df, candidate_df):
 
     ax.set_xlabel("Year", fontdict=normalFont)
     ax.set_ylabel("Excavated Area (m²)", fontdict=normalFont)
-    ax.set_title("Candidate vs Retroconfirmed Excavated Area",fontdict=titleFont)
+    ax.set_title("Candidate vs Retroconfirmed Excavated Area", fontdict=titleFont)
 
     ax.grid(True, which="major", alpha=0.4)
     ax.grid(True, which="minor", alpha=0.15)
-
     ax.legend()
+
     plt.tight_layout()
     plt.savefig(dir + f"mine_{mineid}_ComparisionPlot.png", dpi=300)
     plt.close()
 
+# -------------------------------------------------------------------
+# Normalizes excavated area by total mine area.
+# Enables comparison across mines of different sizes.
+# -------------------------------------------------------------------
 def NormalizedExcavationPlot(mineid, dir, retro_df):
     
-    mine_area_m2 = (gdf[gdf["mine_id"] == mineid].to_crs("EPSG:6933").geometry.area.values[0])
+    # Use equal-area CRS for accurate area computation
+    mine_area_m2 = (
+        gdf[gdf["mine_id"] == mineid]
+        .to_crs("EPSG:6933")
+        .geometry.area.values[0]
+    )
 
-    dfy = retro_df.copy()
-    normalized = dfy["excavated_area_m2"] / mine_area_m2
+    normalized = retro_df["excavated_area_m2"] / mine_area_m2
 
-    df = pd.DataFrame({"date": retro_df["date"],"normalized_excavation": normalized})
+    df = pd.DataFrame({
+        "date": retro_df["date"],
+        "normalized_excavation": normalized
+    })
 
     fig, ax = plt.subplots(figsize=(12, 5))
-
     ax.plot(df["date"], df["normalized_excavation"], linewidth=3, color="tab:green")
 
     ax.xaxis.set_major_locator(mdates.YearLocator())
@@ -372,16 +476,22 @@ def NormalizedExcavationPlot(mineid, dir, retro_df):
     plt.savefig(dir + f"mine_{mineid}_NormalizedExcavation.png", dpi=300)
     plt.close()
 
+    # Saved separately for downstream analysis / UI usage
     df.to_csv(dir + f"mine_{mineid}_ExcavationIntensity.csv", index=False)
 
     return df
 
+# -------------------------------------------------------------------
+# Generates a spatial map showing when excavation was first confirmed.
+# Color encodes days since monitoring start.
+# -------------------------------------------------------------------
 def FirstSeenDateMap(mineid, dir, confirmedFirstSeen, dates, transform, crs, nogo=None):
     H, W = confirmedFirstSeen.shape
 
     start_date = dates[0]
     first_detection_days = np.full((H, W), np.nan, dtype=np.float32)
 
+    # Convert first-seen timestep into days since start
     for y in range(H):
         for x in range(W):
             t0 = confirmedFirstSeen[y, x]
@@ -406,13 +516,14 @@ def FirstSeenDateMap(mineid, dir, confirmedFirstSeen, dates, transform, crs, nog
     minegdf = gdf[gdf["mine_id"] == mineid].to_crs(crs)
     minegdf.boundary.plot(ax=ax, edgecolor="black", linewidth=2)
 
+    # Optional no-go zone overlay for temporal violation context
     if nogo is not None:
         nogo.to_crs(crs).boundary.plot(ax=ax, edgecolor="red", linewidth=2, linestyle="--")
 
     ax.set_title(
         "First Confirmed Excavation Date (Days Since Start)",
         fontdict=titleFont,
-        pad=12  
+        pad=12
     )
     ax.axis("off")
 
@@ -429,8 +540,30 @@ def FirstSeenDateMap(mineid, dir, confirmedFirstSeen, dates, transform, crs, nog
 
     return first_detection_days
 
-def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, crs, nogo=None,expansion_threshold_pixels=20):
+# -------------------------------------------------------------------
+# No-Go Zone Alert System
+#
+# Logs three levels of alerts based on excavation activity intersecting
+# user-defined no-go zones:
+#   LEVEL 1: New candidate (early) excavation signal
+#   LEVEL 2: Newly confirmed sustained excavation
+#   LEVEL 3: Sustained expansion of confirmed excavation over time
+#
+# Alerts are written to a persistent log file for auditability.
+# -------------------------------------------------------------------
+def NoGoAlertSystem(
+    mineid,
+    outDir,
+    dates,
+    candidate,
+    confirmed,
+    transform,
+    crs,
+    nogo=None,
+    expansion_threshold_pixels=20
+):
 
+    # If no no-go zone exists for this mine, skip alert generation entirely
     if nogo is None:
         return  
 
@@ -439,6 +572,7 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
     H, W = candidate.shape[1:]
     pixel_area_m2 = abs(transform.a * transform.e)
 
+    # Rasterize no-go polygons to align perfectly with excavation rasters
     nogo = nogo.to_crs(crs)
     nogo_mask = rasterize_nogo(nogo, (H, W), transform)
 
@@ -446,15 +580,16 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
         for t in range(len(dates)):
             date = dates[t]
 
+            # Mask excavation states to no-go zone only
             cand_mask = (candidate[t] == 1) & nogo_mask
             conf_mask = (confirmed[t] == 1) & nogo_mask
 
             cand_pixels = np.count_nonzero(cand_mask)
             conf_pixels = np.count_nonzero(conf_mask)
 
-            cand_area = cand_pixels * pixel_area_m2
-            conf_area = conf_pixels * pixel_area_m2
-
+            # -----------------------
+            # LEVEL 1: Candidate intrusion
+            # -----------------------
             if t > 0:
                 prev_cand = (candidate[t-1] == 1) & nogo_mask
                 new_candidate = cand_mask & (~prev_cand)
@@ -467,6 +602,9 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
                         f"Affected area: {area:.1f} m²\n\n"
                     )
 
+            # -----------------------
+            # LEVEL 2: Confirmed violation
+            # -----------------------
             if t > 0:
                 prev_conf = (confirmed[t-1] == 1) & nogo_mask
                 new_confirmed = conf_mask & (~prev_conf)
@@ -479,9 +617,12 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
                         f"Affected area: {area:.1f} m²\n\n"
                     )
 
-            # --- LEVEL 3: sustained expansion over time window ---
+            # -----------------------
+            # LEVEL 3: Sustained expansion over time window
+            # -----------------------
             window_days = 60
 
+            # Find the earliest timestep within the rolling window
             window_start = t
             while window_start > 0 and (dates[t] - dates[window_start]).days < window_days:
                 window_start -= 1
@@ -489,6 +630,7 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
             prev_conf_mask = (confirmed[window_start] == 1) & nogo_mask
             prev_conf_pixels = np.count_nonzero(prev_conf_mask)
 
+            # Trigger only if confirmed excavation has grown meaningfully
             if conf_pixels > prev_conf_pixels + expansion_threshold_pixels:
                 delta_pixels = conf_pixels - prev_conf_pixels
                 delta_area = delta_pixels * pixel_area_m2
@@ -499,13 +641,32 @@ def NoGoAlertSystem(mineid, outDir,  dates, candidate,  confirmed, transform, cr
                     f"Added area over last {window_days} days: {delta_area:.1f} m²\n\n"
                 )
 
-def NoGoExcavationTimePlot(mineid, outDir, dates, candidate, confirmed, transform,crs, nogo=None):
+# -------------------------------------------------------------------
+# Time-series plot of excavation activity inside no-go zones.
+#
+# Separately tracks:
+#   - Candidate excavation area (early signals)
+#   - Confirmed excavation area (persistent violations)
+#
+# Outputs both a plot and a CSV for UI and reporting.
+# -------------------------------------------------------------------
+def NoGoExcavationTimePlot(
+    mineid,
+    outDir,
+    dates,
+    candidate,
+    confirmed,
+    transform,
+    crs,
+    nogo=None
+):
     if nogo is None:
         return None
 
     H, W = candidate.shape[1:]
     pixel_area_m2 = abs(transform.a * transform.e)
 
+    # Rasterize no-go zones for spatial alignment
     nogo = nogo.to_crs(crs)
     nogo_mask = geometry_mask(
         nogo.geometry,
@@ -531,8 +692,18 @@ def NoGoExcavationTimePlot(mineid, outDir, dates, candidate, confirmed, transfor
     })
 
     plt.figure(figsize=(10, 5))
-    plt.plot(df["date"], df["candidate_area_m2"], label="Candidate (Early)", linestyle="--")
-    plt.plot(df["date"], df["confirmed_area_m2"], label="Confirmed", linewidth=2)
+    plt.plot(
+        df["date"],
+        df["candidate_area_m2"],
+        label="Candidate (Early)",
+        linestyle="--"
+    )
+    plt.plot(
+        df["date"],
+        df["confirmed_area_m2"],
+        label="Confirmed",
+        linewidth=2
+    )
 
     plt.xlabel("Date", fontdict=normalFont)
     plt.ylabel("Excavated Area in No-Go Zone (m²)", fontdict=normalFont)
@@ -543,10 +714,16 @@ def NoGoExcavationTimePlot(mineid, outDir, dates, candidate, confirmed, transfor
     plt.xticks(rotation=45)
     plt.tight_layout()
 
-    plt.savefig(outDir + f"mine_{mineid}_NoGo_Excavation_vs_Time.png", dpi=300)
+    plt.savefig(
+        outDir + f"mine_{mineid}_NoGo_Excavation_vs_Time.png",
+        dpi=300
+    )
     plt.close()
 
-    df.to_csv(outDir + f"mine_{mineid}_NoGo_Excavation_vs_Time.csv", index=False)
+    # CSV output for UI + reporting
+    df.to_csv(
+        outDir + f"mine_{mineid}_NoGo_Excavation_vs_Time.csv",
+        index=False
+    )
 
     return df
-
