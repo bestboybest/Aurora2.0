@@ -634,7 +634,6 @@ with tab4:
             with col4:
                 if 'Severity' in alerts_df.columns:
                     info = len(alerts_df[alerts_df['Severity'] == 'INFO'])
-                    st.metric("Informational", info)
             
             st.markdown("---")
             
