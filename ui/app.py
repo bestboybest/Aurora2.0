@@ -6,6 +6,9 @@ from datetime import datetime
 
 st.set_page_config(page_title="AURORA 2.0 - ISRO Monitoring", layout="wide", initial_sidebar_state="collapsed")
 
+if 'current_mine' not in st.session_state:
+    st.session_state.current_mine = None
+
 st.markdown("""
 <style>
     /* Main title styling */
@@ -59,7 +62,7 @@ st.markdown("""
         font-weight: 700;
     }
     
-    /* Sidebar styling */
+    /* Sidebar styling - COMPACT VERSION */
     [data-testid="stSidebar"] {
         background: linear-gradient(180deg, #1a252f 0%, #2c3e50 100%);
     }
@@ -71,36 +74,54 @@ st.markdown("""
     [data-testid="stSidebar"] .stSelectbox label {
         color: #ecf0f1 !important;
         font-weight: 600;
+        font-size: 0.9rem;
     }
     
     [data-testid="stSidebar"] .stMetric label {
         color: #bdc3c7 !important;
+        font-size: 0.85rem;
     }
     
     [data-testid="stSidebar"] .stMetric [data-testid="stMetricValue"] {
         color: #3498db !important;
+        font-size: 1.8rem;
     }
     
     [data-testid="stSidebar"] h3 {
         color: #ecf0f1 !important;
         border-bottom: 2px solid #34495e;
-        padding-bottom: 0.5rem;
+        padding-bottom: 0.3rem;
+        margin-bottom: 0.5rem;
+        font-size: 1.1rem;
+    }
+    
+    [data-testid="stSidebar"] h2 {
+        font-size: 1.3rem;
+        margin-bottom: 0.3rem;
     }
     
     [data-testid="stSidebar"] hr {
         border-color: #34495e;
-        margin: 1.5rem 0;
+        margin: 0.8rem 0;
     }
     
     [data-testid="stSidebar"] .stAlert {
         background-color: #34495e !important;
         color: #ecf0f1 !important;
         border: 1px solid #2c3e50;
+        padding: 0.6rem;
+        font-size: 0.85rem;
     }
     
     [data-testid="stSidebar"] caption {
         color: #95a5a6 !important;
-        font-size: 0.85rem;
+        font-size: 0.75rem;
+    }
+    
+    /* Compact sidebar text */
+    [data-testid="stSidebar"] p {
+        margin-bottom: 0.3rem;
+        font-size: 0.9rem;
     }
     
     /* Tab styling */
@@ -127,7 +148,7 @@ st.markdown("""
         font-size: 0.9rem;
         border-top: 2px solid #ecf0f1;
         margin-top: 3rem;
-    }
+    }        
 </style>
 """, unsafe_allow_html=True)
 
@@ -253,6 +274,7 @@ def categorize_images(images):
     """Intelligently categorize images into logical groups"""
     categories = {
         "spatial": [],
+        "progress": [],
         "area_analysis": [],
         "growth_metrics": [],
         "no_go_violations": [],
@@ -264,11 +286,13 @@ def categorize_images(images):
         
         if "spatialmap" in img_lower or "percent" in img_lower:
             categories["spatial"].append(img)
+        elif "progress" in img_lower: 
+            categories["progress"].append(img)
         elif "no_go" in img_lower:
             categories["no_go_violations"].append(img)
         elif any(x in img_lower for x in ["areavstime", "candidatearea", "comparision"]):
             categories["area_analysis"].append(img)
-        elif any(x in img_lower for x in ["normalized", "growthrate", "progress", "firstseen"]):
+        elif any(x in img_lower for x in ["normalized", "growthrate", "firstseen"]):
             categories["growth_metrics"].append(img)
         else:
             categories["other"].append(img)
@@ -328,20 +352,31 @@ with st.sidebar:
         help="Choose a mine site to view monitoring data"
     )
     
+    st.session_state.current_mine = mine_id
+
     st.markdown("---")
     
-    # Mine info card
+    # Mine info card - COMPACT
     st.markdown("### Site Information")
-    st.info(f"""
-    **Mine Site ID:** {mine_id}  
-    **Status:** Active Monitoring  
-    **Data Location:** `Mine_{mine_id}_Data`
-    """)
-    
-    st.markdown("---")
+
+    st.markdown(f"""
+    <div style="
+        background: #1e2a36;
+        border: 1px solid #34495e;
+        border-radius: 8px;
+        padding: 0.8rem 1rem;
+        color: #ecf0f1;
+        font-size: 0.9rem;
+    ">
+    <b>Mine Site ID:</b> {mine_id}<br>
+    <b>Status:</b> Active Monitoring<br>
+    <b>Data Location:</b> <code>Mine_{mine_id}_Data</code>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Quick stats
     out_dir = outputs_dir(mine_id)
+    intensity_csv = os.path.join(out_dir, f"mine_{mine_id}_ExcavationIntensity.csv")
     if os.path.exists(out_dir):
         files = list_files(out_dir)
         images = [f for f in files if f.lower().endswith((".png", ".jpg", ".jpeg"))]
@@ -353,6 +388,15 @@ with st.sidebar:
             st.metric("Maps", len(images))
         with col2:
             st.metric("Reports", len(csvs))
+
+    if os.path.exists(intensity_csv):
+        df = pd.read_csv(intensity_csv)
+        latest_area = df["excavated_area_m2"].iloc[-1]
+
+        st.metric(
+            "Current Excavated Area",
+            f"{latest_area:,.0f} m²"
+        )
         
         # Check for alerts
         alert_log = alerts_file(mine_id)
@@ -360,8 +404,20 @@ with st.sidebar:
             alerts_df = parse_alerts(alert_log)
             if alerts_df is not None and not alerts_df.empty:
                 st.markdown("---")
-                st.warning(f"**{len(alerts_df)} Alert(s) Detected**")
-    
+                st.markdown(f"""
+                <div style="
+                background:#2d3f2f;
+                border:1px solid #3c5a40;
+                border-radius:8px;
+                padding:0.6rem 0.8rem;
+                color:#c7e8c9;
+                font-size:0.9rem;
+                font-weight:600;
+                ">
+                {len(alerts_df)} Alert(s) Detected
+                </div>
+                """, unsafe_allow_html=True)
+
     st.markdown("---")
     st.caption(f"Last Updated: {datetime.now().strftime('%Y-%m-%d')}")
     st.caption("ISRO Authorized System")
@@ -412,49 +468,71 @@ with tab1:
         
         st.markdown("---")
         
-        # Display in organized 2-column grid
-        cols_per_row = 2
-        for i in range(0, len(spatial_maps), cols_per_row):
-            cols = st.columns(cols_per_row)
+        for img in spatial_maps:
+            path = os.path.join(out_dir, img)
+
+            if "_0percent" in img.lower():
+                stage = "0% – Initial State"
+            elif "_25percent" in img.lower():
+                stage = "25% – Early Development"
+            elif "_50percent" in img.lower():
+                stage = "50% – Mid-point"
+            elif "_75percent" in img.lower():
+                stage = "75% – Advanced Stage"
+            elif "_100percent" in img.lower():
+                stage = "100% – Current Status"
+            else:
+                stage = "Monitoring Stage"
+
+            display_image_with_style(
+                path,
+                title=f"Stage: {stage}",
+                caption=f"File: {img}"
+            )
+
+            st.markdown("---")
+
+        progress_imgs = categories["progress"]
+        if progress_imgs:
+            st.markdown('<div class="section-header">Complete Temporal Evolution</div>', unsafe_allow_html=True)
+            st.markdown("""
+            **Full Timeline Grid:** Comprehensive view of excavation progression across the entire monitoring period.
+            """)
             
-            for j, col in enumerate(cols):
-                if i + j < len(spatial_maps):
-                    img = spatial_maps[i + j]
-                    path = os.path.join(out_dir, img)
-                    
-                    with col:
-                        # Extract stage from filename
-                        img_lower = img.lower()
-                        
-                        if "_0percent" in img_lower:
-                            stage = "0% - Initial State"
-                        elif "_25percent" in img_lower:
-                            stage = "25% - Early Development"
-                        elif "_50percent" in img_lower:
-                            stage = "50% - Mid-point"
-                        elif "_75percent" in img_lower:
-                            stage = "75% - Advanced Stage"
-                        elif "_100percent" in img_lower:
-                            stage = "100% - Current Status"
-                        else:
-                            stage = "Monitoring Progress"
-                        
-                        title = f"Stage: {stage}"
-                        caption = f"File: {img}"
-                        
-                        display_image_with_style(path, title, caption)
-                        st.markdown("")  # Add spacing
+            for img in progress_imgs:
+                path = os.path.join(out_dir, img)
+                display_image_with_style(
+                    path,
+                    title="Excavation Progress Overview (0-100 Percentile)",
+                    caption=f"File: {img}"
+                )
         
         # Download section
         st.markdown("---")
         with st.expander("Download Spatial Maps"):
             st.markdown("**Available Maps for Download:**")
             cols = st.columns(3)
+            
+            # Download spatial maps
             for idx, img in enumerate(spatial_maps):
                 with cols[idx % 3]:
                     with open(os.path.join(out_dir, img), "rb") as f:
                         st.download_button(
                             label=f"Download {img.split('_')[-1].replace('.png', '')}",
+                            data=f,
+                            file_name=img,
+                            mime="image/png",
+                            use_container_width=True
+                        )
+            
+            # Download progress grid images
+            if progress_imgs:
+                st.markdown("---")
+                st.markdown("**Progress Grid:**")
+                for img in progress_imgs:
+                    with open(os.path.join(out_dir, img), "rb") as f:
+                        st.download_button(
+                            label=f"Download {img}",
                             data=f,
                             file_name=img,
                             mime="image/png",

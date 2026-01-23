@@ -130,7 +130,7 @@ def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, c
     ]
 
     for i, (t, p) in enumerate(zip(t_idxs, percentiles)):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
         # Fetch background RGB imagery
         mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
@@ -202,6 +202,7 @@ def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, c
         minegdf.boundary.plot(ax=ax2, edgecolor="black", linewidth=2)
         ax2.axis("off")
         plt.colorbar(im, ax=ax2, fraction=0.046)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
 
         plt.savefig(
             dir + f"mine_{mineid}_spatialMap_{p}percent.png",
@@ -225,7 +226,7 @@ def retroConfirmedAnalysis(mineid, dates, dir, retroConfirmed, transform, crs, n
     minegdf = gdf[gdf["mine_id"] == mineid]
     mine = geemap.geopandas_to_ee(minegdf)
 
-    fig, axes = plt.subplots(3, 4, figsize=(22, 14))
+    fig, axes = plt.subplots(3, 4, figsize=(20, 12))
     axes = axes.flatten()
 
     minx, miny, maxx, maxy = minegdf.total_bounds
@@ -442,7 +443,6 @@ def ComparisionPlot(mineid, dir, retro_df, candidate_df):
 # Enables comparison across mines of different sizes.
 # -------------------------------------------------------------------
 def NormalizedExcavationPlot(mineid, dir, retro_df):
-    
     # Use equal-area CRS for accurate area computation
     mine_area_m2 = (
         gdf[gdf["mine_id"] == mineid]
@@ -450,25 +450,24 @@ def NormalizedExcavationPlot(mineid, dir, retro_df):
         .geometry.area.values[0]
     )
 
-    normalized = retro_df["excavated_area_m2"] / mine_area_m2
+    df = retro_df.copy()
 
-    df = pd.DataFrame({
-        "date": retro_df["date"],
-        "normalized_excavation": normalized
-    })
+    # Absolute already exists as excavated_area_m2
+    df["normalized_excavation"] = df["excavated_area_m2"] / mine_area_m2
 
+    # Save BOTH
+    out_path = dir + f"mine_{mineid}_ExcavationIntensity.csv"
+    df.to_csv(out_path, index=False)
+
+    # Plot normalized
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(df["date"], df["normalized_excavation"], linewidth=3, color="tab:green")
 
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.xaxis.set_minor_locator(mdates.MonthLocator(interval=6))
-
+    ax.set_ylim(0, 1)
     ax.set_xlabel("Year", fontdict=normalFont)
     ax.set_ylabel("Normalized Excavation (fraction of mine)", fontdict=normalFont)
     ax.set_title("Normalized Retroconfirmed Excavation vs Time", fontdict=titleFont)
 
-    ax.set_ylim(0, 1)
     ax.grid(True, which="major", alpha=0.4)
     ax.grid(True, which="minor", alpha=0.15)
 
@@ -476,11 +475,7 @@ def NormalizedExcavationPlot(mineid, dir, retro_df):
     plt.savefig(dir + f"mine_{mineid}_NormalizedExcavation.png", dpi=300)
     plt.close()
 
-    # Saved separately for downstream analysis / UI usage
-    df.to_csv(dir + f"mine_{mineid}_ExcavationIntensity.csv", index=False)
-
     return df
-
 # -------------------------------------------------------------------
 # Generates a spatial map showing when excavation was first confirmed.
 # Color encodes days since monitoring start.
@@ -500,7 +495,7 @@ def FirstSeenDateMap(mineid, dir, confirmedFirstSeen, dates, transform, crs, nog
 
     detection_masked = np.ma.masked_invalid(first_detection_days)
 
-    fig, ax = plt.subplots(figsize=(9, 9))
+    fig, ax = plt.subplots(figsize=(5, 5))
 
     bounds = array_bounds(H, W, transform)
     extent = [bounds[0], bounds[2], bounds[1], bounds[3]]
@@ -577,6 +572,7 @@ def NoGoAlertSystem(
     nogo_mask = rasterize_nogo(nogo, (H, W), transform)
 
     with open(alert_path, "a") as log:
+        prev_level3_triggered = False
         for t in range(len(dates)):
             date = dates[t]
 
@@ -631,15 +627,19 @@ def NoGoAlertSystem(
             prev_conf_pixels = np.count_nonzero(prev_conf_mask)
 
             # Trigger only if confirmed excavation has grown meaningfully
-            if conf_pixels > prev_conf_pixels + expansion_threshold_pixels:
+            level3_condition = conf_pixels > prev_conf_pixels + expansion_threshold_pixels
+
+            if level3_condition and not prev_level3_triggered:
                 delta_pixels = conf_pixels - prev_conf_pixels
                 delta_area = delta_pixels * pixel_area_m2
 
                 log.write(
-                    f"[{date}] | Mine {mineid} | LEVEL 3 | VIOLATION EXPANSION\n"
-                    f"Sustained expansion of confirmed excavation inside no-go zone.\n"
-                    f"Added area over last {window_days} days: {delta_area:.1f} m²\n\n"
+                     f"[{date}] | Mine {mineid} | LEVEL 3 | VIOLATION EXPANSION\n"
+                        f"Sustained expansion of confirmed excavation inside no-go zone.\n"
+                        f"Added area over last {window_days} days: {delta_area:.1f} m²\n\n"
                 )
+
+            prev_level3_triggered = level3_condition
 
 # -------------------------------------------------------------------
 # Time-series plot of excavation activity inside no-go zones.

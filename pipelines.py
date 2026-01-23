@@ -683,6 +683,8 @@ def monitoringComplete(mineid, threshold, debug = 0):
     mainDir = f"./Mine Data/Mine_{mineid}_data/"
     outDir = f"./Mine Data/Mine_{mineid}_data/Outputs/"
 
+    alert_log_path = os.path.join(outDir, f"mine_{mineid}_alerts.log")
+
     # Allow processing multiple GeoTIFF chunks if needed
     if isinstance(debug, (int, str)):
         debug_list = [debug]
@@ -720,6 +722,10 @@ def monitoringComplete(mineid, threshold, debug = 0):
 
     # Load no-go zone polygon if present
     nogo = loadNogo(mineid, crs)
+
+    if nogo is not None:
+        with open(alert_log_path, "w") as f:
+            f.write(f"# Monitoring run started: {datetime.now()}\n")
 
     # Stack all temporal data
     Efixed = np.concatenate(all_E, axis=0)
