@@ -129,6 +129,16 @@ def makeSpatialMaps(mineid, dir, dates, retroConfirmed, confidence, transform, c
         for t in t_idxs
     ]
 
+    # Use Below code for self-validation
+
+    #poly_50 = retroPolys[2].to_crs("EPSG:4326")
+
+    #if not poly_50.empty:
+      #  poly_50.to_file(
+     #       dir + f"mine_{mineid}_50percent.geojson",
+     #       driver="GeoJSON"
+     #   )
+
     for i, (t, p) in enumerate(zip(t_idxs, percentiles)):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
