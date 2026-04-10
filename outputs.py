@@ -727,3 +727,17 @@ def NoGoExcavationTimePlot(
     )
 
     return df
+
+def KSelectionPlot(mineid, dir, k_scores):
+    plt.figure(figsize=(8, 5))
+    plt.plot(list(k_scores.keys()), list(k_scores.values()), marker='o')
+
+    plt.xlabel("K", fontdict=normalFont)
+    plt.ylabel("Silhouette Score", fontdict=normalFont)
+    plt.title("K Selection using Silhouette Score", fontdict=titleFont)
+
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    plt.savefig(dir + f"mine_{mineid}_KSelection.png", dpi=300)
+    plt.close()

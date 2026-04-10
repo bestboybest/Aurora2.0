@@ -442,8 +442,9 @@ def trainingStart(startTime, endTime, mineid, windowSize, debug = 0):
 # 5. Prunes weak / false excavation clusters
 # 6. Saves everything needed for monitoring
 # -------------------------------------------------------------------
-def trainingComplete(mineid, debug = 0, k = 6):
+def trainingComplete(mineid, debug = 0, k = 8):
     mainDir = f"./Mine Data/Mine_{mineid}_data/"
+    outDir = f"./Mine Data/Mine_{mineid}_data/Outputs/"
 
     # Load extracted feature table
     df = pd.read_csv(mainDir + f"mine_{mineid}_features_{debug}.csv")
@@ -477,6 +478,7 @@ def trainingComplete(mineid, debug = 0, k = 6):
     kmeans = KMeans(n_clusters = k, random_state = 42, n_init = 10)
     kmeans.fit(dfScaled)
     joblib.dump(kmeans, mainDir + "kmeans.pkl")
+    labels = kmeans.labels_
 
     # ----------------------------------------------------------------
     # META-CLUSTERING STEP
@@ -485,18 +487,52 @@ def trainingComplete(mineid, debug = 0, k = 6):
     # Solution: Clamp SWIR-like features before meta-clustering
     # ----------------------------------------------------------------
     centroids = kmeans.cluster_centers_
-    centroids_for_meta = centroids.copy()
 
-    swir_indices = [
+    dfSuppressed = dfScaled.copy()
+
+    low_indices = [
         features.index("B11"),
         features.index("B12"),
         features.index("B11_median"),
         features.index("B12_median"),
-        features.index("NDMI_median")
+        features.index("BSI_median")
     ]
 
-    for idx in swir_indices:
-        centroids_for_meta[:, idx] = np.maximum(centroids_for_meta[:, idx], -1.0)
+    high_indices = [
+        features.index("NDVI"),
+        features.index("NDVI_median"),
+        features.index("NDMI_median"),
+        features.index("NBR_slope")
+    ]
+
+    # We use a hard clamp to a max and min of (q1 - 1.5 * iqr) and (q3 + 1.5 * iqr) to actually get the outliers instead of being aggressive with the clamping
+    # This is more statistically correct
+
+    for idx in low_indices:
+        q3 = np.percentile(dfScaled[:, idx], 75)
+        q1 = np.percentile(dfScaled[:, idx], 25)
+        iqr = q3 - q1
+
+        lower_bound = q1 - 1.5 * iqr
+        dfSuppressed[:, idx] = np.maximum(dfSuppressed[:, idx], lower_bound)
+    
+    for idx in high_indices:
+        q3 = np.percentile(dfScaled[:, idx], 75)
+        q1 = np.percentile(dfScaled[:, idx], 25)
+        iqr = q3 - q1
+
+        upper_bound = q3 + 1.5 * iqr
+        dfSuppressed[:, idx] = np.minimum(dfSuppressed[:, idx], upper_bound) 
+    
+    centroids_for_meta = np.zeros_like(centroids)
+
+    for i in range(k):
+        cluster_pixels = dfSuppressed[labels == i]
+
+        if len(cluster_pixels) == 0:
+            centroids_for_meta[i] = centroids[i]  # fallback
+        else:
+            centroids_for_meta[i] = np.mean(cluster_pixels, axis=0)
 
     # Meta-clustering separates excavated vs non-excavated clusters
     metaKMeans = KMeans(n_clusters = 2, random_state = 42, n_init = 10)
@@ -530,41 +566,66 @@ def trainingComplete(mineid, debug = 0, k = 6):
         )
         cluster_scores[i] = score
 
-    leader_idx = max(cluster_scores, key=cluster_scores.get)
-    leader_score = cluster_scores[leader_idx]
+    # -----------------------------------------
+    # NEW PRUNING: leader-distance based
+    # -----------------------------------------
+
+    # If nothing found (edge case)
+    if len(cluster_scores) == 0:
+        selected_clusters = set()
+    else:
+        # Sort scores
+        scores = list(cluster_scores.values())
+        best_score = max(scores)
+
+        # Distance from leader
+        distances = [best_score - s for s in scores]
+
+        # Robust statistics
+        median_d = np.median(distances)
+        q1 = np.percentile(distances, 25)   
+        q3 = np.percentile(distances, 75)
+        iqr_d = q3 - q1
+
+        # Alpha controls aggressiveness (~1.0–1.5)
+        alpha = 1.0
+
+        # Select clusters
+        selected_clusters = set()
+
+        for i, s in cluster_scores.items():
+            d = best_score - s
+
+            if (d <= median_d + alpha * iqr_d) and (s >= 0.6 * best_score):
+                selected_clusters.add(i)
+
+    # -----------------------------------------
+    # FINAL LABEL ASSIGNMENT
+    # -----------------------------------------
 
     final_labels = []
 
     for i in range(k):
         is_mine = False
 
-        if metaLabels[i] == exLabel:
-            current_score = cluster_scores.get(i, -np.inf)
-
-            # Always keep the strongest excavation cluster
-            if i == leader_idx:
+        if i in selected_clusters and metaLabels[i] == exLabel:
+            # Physics constraint (VERY IMPORTANT)
+            if centroids[i][ndvi_idx] <= 0.5:
                 is_mine = True
-            # Keep secondary clusters only if sufficiently strong
-            elif current_score > (leader_score * 0.60):
-                is_mine = True
-
-            # Hard safety filters
-            if current_score < 0.5:
-                is_mine = False
-            if centroids[i][ndvi_idx] > 0.5:
-                is_mine = False
 
         final_labels.append(1 if is_mine else 0)
 
+    best_k = k
+
     # Persist cluster labels and centroids for monitoring
     metadata = {
-        "cluster_labels": {str(i): final_labels[i] for i in range(k)},
+        "cluster_labels": {str(i): final_labels[i] for i in range(best_k)},
         "centroids": {
             str(i): {
                 features[j]: float(centroids[i][j])
                 for j in range(len(features))
             }
-            for i in range(k)
+            for i in range(best_k)
         },
         "excavated_metacluster": int(exLabel),
         "metacluster_stats": {
@@ -823,3 +884,4 @@ def monitoringComplete(mineid, threshold, debug = 0):
         for p in [0, 20, 40, 60, 80, 100]
     ]:
         debugCluster(mineid, i, dates, Efixed)
+    
