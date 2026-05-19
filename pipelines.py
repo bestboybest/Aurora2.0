@@ -216,6 +216,10 @@ def findExcavated(centroids, labels):
 
     # The metacluster with the higher excavation score is considered excavated
     exLabel = 0 if scores[0] > scores[1] else 1
+    # At the end of findExcavated(), before the return, add:
+    if scores[0] < 0 and scores[1] < 0:
+    # Both negative — pick relatively better one, shift doesn't matter
+        pass  # existing logic already picks the higher one correctly
     return exLabel, scores
 
 # Creates an Earth Engine-compatible robust scaling function
@@ -307,9 +311,195 @@ def retrieveDates(bandNames, E):
     merged_E = np.stack(merged_E)
     return merged_E, merged_dates
 
+# -------------------------------------------------------------------
+# SAR SECTION
+# -------------------------------------------------------------------
+
+# -------------------------------------------------------------------
+# SAR Monitoring (Part 1 - Earth Engine Export)
+#
+# Exports a binary excavation mask derived from Sentinel-1 GRD
+# backscatter. Values: 1=excavated, 0=non-excavated, 2=unknown/masked
+#
+# This is intentionally simple — SAR is used only as a gap-filler
+# for cloud-covered periods, not as the primary classification.
+# A speckle filter is applied first to reduce noise.
+#
+# The VV threshold (-12 dB) separates bare/excavated ground from
+# vegetated surfaces. Tune this per mine site if needed.
+# -------------------------------------------------------------------
+def sarMonitoringStart(startTime, endTime, mineid, debug=0):
+    mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
+
+    sar = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterDate(startTime, endTime)
+        .filterBounds(mine)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+        .select(["VV", "VH"])
+    )
+
+    def classifySAR(image):
+        # Speckle filter: 3x3 focal mean before thresholding
+        vv = image.select("VV").focalMean(3, "square", "pixels")
+
+        # VV > -12 dB = likely bare/excavated ground (laterite)
+        # VV <= -12 dB = vegetation or water
+        excavated = vv.gt(-12).rename("excavated")
+
+        return (
+            excavated
+            .unmask(2)
+            .toByte()
+            .copyProperties(image, ["system:time_start"])
+        )
+
+    sar = sar.map(classifySAR).sort("system:time_start")
+    sar = sar.toBands().clip(mine)
+
+    task = ee.batch.Export.image.toDrive(
+        image=sar,
+        description=f"mine_{mineid}_sar_{debug}",
+        fileNamePrefix=f"mine_{mineid}_sar_{debug}",
+        region=mine.geometry(),
+        scale=10,
+        maxPixels=1e13
+    )
+    task.start()
+
+# -------------------------------------------------------------------
+# SAR Monitoring (Part 2 - Load SAR GeoTIFF into numpy)
+#
+# Loads the exported SAR GeoTIFF and returns (sar_E, sar_dates)
+# in the same format as Efixed — shape (T, H, W), values 0/1/2.
+#
+# S1 band names from EE look like:
+#   S1A_IW_GRDH_1SDV_20220103T...
+# The date is extracted by finding the first 8-digit numeric token.
+# -------------------------------------------------------------------
+def parseSARDates(bandNames):
+    import re
+    dates = []
+    for name in bandNames:
+        # Find first 8-digit sequence in the band name — that's YYYYMMDD
+        match = re.search(r'(\d{8})', name)
+        if match:
+            dates.append(datetime.strptime(match.group(1), "%Y%m%d").date())
+        else:
+            raise ValueError(f"Could not parse date from SAR band name: {name}")
+    return dates
+
+def loadSAR(mineid, debug=0):
+    mainDir  = f"./Mine Data/Mine_{mineid}_data/"
+    tif_path = mainDir + f"mine_{mineid}_sar_{debug}.tif"
+
+    if not os.path.exists(tif_path):
+        return None, None
+
+    with rasterio.open(tif_path) as src:
+        E         = src.read()
+        bandNames = src.descriptions
+
+    # Parse SAR-specific band name format (S1A_IW_GRDH_1SDV_YYYYMMDD...)
+    dates = parseSARDates(bandNames)
+
+    # Merge same-day observations (same logic as S2)
+    merged_E     = []
+    merged_dates = []
+
+    i = 0
+    while i < len(dates):
+        current_date = dates[i]
+        day_imgs     = [E[i]]
+        j = i + 1
+
+        while j < len(dates) and dates[j] == current_date:
+            day_imgs.append(E[j])
+            j += 1
+
+        stack         = np.stack(day_imgs)
+        has_excavation = np.any(stack == 1, axis=0)
+        has_known      = np.any(stack != 2, axis=0)
+
+        merged        = np.full(stack.shape[1:], 2, dtype=np.uint8)
+        merged[has_excavation] = 1
+        merged[(~has_excavation) & has_known] = 0
+
+        merged_E.append(merged)
+        merged_dates.append(current_date)
+        i = j
+
+    return np.stack(merged_E), merged_dates
+
+# -------------------------------------------------------------------
+# SAR Gap-Fill
+#
+# Fills unknown (2) pixels in Efixed using SAR classifications,
+# but ONLY where S2 had no valid observation on that date.
+#
+# consecutive_required: how many nearby SAR observations must agree
+#   before filling. Default=2 (~12 days of consistent SAR signal).
+#   Increase to 3 if candidate area inflates during monsoon.
+#
+# max_gap_days: SAR observations within this window of the S2 date
+#   are considered "nearby". Matches S1 revisit (~6 days).
+#
+# Fill logic:
+#   - Excavated fill: ALL nearby SAR obs agree = 1
+#   - Clear fill:     ALL nearby SAR obs agree = 0
+#   - Disagreement:   pixel stays 2 (unknown)
+#
+# This means a single noisy SAR image cannot confirm excavation.
+# Both passes must agree, giving ~12 days of consistent signal
+# as the minimum bar — appropriate for persistent surface change.
+# -------------------------------------------------------------------
+def sarGapFill(Efixed, dates, sar_E, sar_dates, consecutive_required=2, max_gap_days=6):
+    if sar_E is None or sar_dates is None:
+        return Efixed
+
+    filled = Efixed.copy()
+
+    for t, date in enumerate(dates):
+        unknown_mask = Efixed[t] == 2
+
+        # If S2 is fully valid on this date, skip — SAR not needed
+        if not np.any(unknown_mask):
+            continue
+
+        # Find ALL SAR observations within the time window
+        nearby_indices = [
+            i for i, sd in enumerate(sar_dates)
+            if abs((date - sd).days) <= max_gap_days
+        ]
+
+        # Not enough SAR passes nearby — leave as unknown
+        if len(nearby_indices) < consecutive_required:
+            continue
+
+        # Stack all nearby SAR slices: shape (N, H, W)
+        nearby_slices = np.stack([sar_E[i] for i in nearby_indices])
+
+        # Consensus check: ALL nearby observations must agree
+        sar_agrees_excavated = np.all(nearby_slices == 1, axis=0)
+        sar_agrees_clear     = np.all(nearby_slices == 0, axis=0)
+
+        # Only fill pixels that are unknown in S2
+        fillable_excavated = unknown_mask & sar_agrees_excavated
+        fillable_clear     = unknown_mask & sar_agrees_clear
+
+        filled[t][fillable_excavated] = 1
+        filled[t][fillable_clear]     = 0
+        # Pixels where SAR disagrees stay as 2 (unknown)
+
+    return filled
+
+# -------------------------------------------------------------------
 # Implements temporal confirmation logic:
 # pixels must remain excavated for a threshold duration
 # before being marked as confirmed.
+# -------------------------------------------------------------------
 def confidenceSystem(E, dates, threshold):
     T, H, W = E.shape
 
@@ -354,8 +544,10 @@ def confidenceSystem(E, dates, threshold):
 
     return confirmed, candidate, confidence, confirmedFirstSeen
 
+# -------------------------------------------------------------------
 # Retroactively marks excavation as confirmed
 # from the first detection until confirmation.
+# -------------------------------------------------------------------
 def retroConfirm(confirmed, firstSeen):
     T, H, W = confirmed.shape
     retroConfirmed = np.zeros_like(confirmed)
@@ -373,7 +565,7 @@ def retroConfirm(confirmed, firstSeen):
     return retroConfirmed
 
 # Loads the no-go zone polygon for a given mine if it exists.
-def loadNogo(mineid, crs = None):
+def loadNogo(mineid, crs=None):
     path = f"./Mine Data/Mine_{mineid}_Data/nogozones.geojson"
     if not os.path.exists(path):
         return None
@@ -396,7 +588,7 @@ def loadNogo(mineid, crs = None):
 # We intentionally start feature computation earlier than startTime
 # to allow rolling statistics (medians, variance, slope) to stabilize.
 # -------------------------------------------------------------------
-def trainingStart(startTime, endTime, mineid, windowSize, debug = 0):
+def trainingStart(startTime, endTime, mineid, windowSize, debug=0):
     startTime = ee.Date(startTime)
 
     # Extend the start time backwards so rolling windows have context
@@ -425,9 +617,9 @@ def trainingStart(startTime, endTime, mineid, windowSize, debug = 0):
 
     # Export the feature table to Google Drive for offline training
     task = ee.batch.Export.table.toDrive(
-        collection = s2,
-        description = f"mine_{mineid}_features_{debug}",
-        fileFormat = "CSV"
+        collection=s2,
+        description=f"mine_{mineid}_features_{debug}",
+        fileFormat="CSV"
     )
     task.start()
 
@@ -442,9 +634,9 @@ def trainingStart(startTime, endTime, mineid, windowSize, debug = 0):
 # 5. Prunes weak / false excavation clusters
 # 6. Saves everything needed for monitoring
 # -------------------------------------------------------------------
-def trainingComplete(mineid, debug = 0, k = 8):
+def trainingComplete(mineid, debug=0, k=8):
     mainDir = f"./Mine Data/Mine_{mineid}_data/"
-    outDir = f"./Mine Data/Mine_{mineid}_data/Outputs/"
+    outDir  = f"./Mine Data/Mine_{mineid}_data/Outputs/"
 
     # Load extracted feature table
     df = pd.read_csv(mainDir + f"mine_{mineid}_features_{debug}.csv")
@@ -475,7 +667,7 @@ def trainingComplete(mineid, debug = 0, k = 8):
 
     # Primary clustering:
     # k is chosen empirically to separate distinct surface regimes
-    kmeans = KMeans(n_clusters = k, random_state = 42, n_init = 10)
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
     kmeans.fit(dfScaled)
     joblib.dump(kmeans, mainDir + "kmeans.pkl")
     labels = kmeans.labels_
@@ -505,14 +697,12 @@ def trainingComplete(mineid, debug = 0, k = 8):
         features.index("NBR_slope")
     ]
 
-    # We use a hard clamp to a max and min of (q1 - 1.5 * iqr) and (q3 + 1.5 * iqr) to actually get the outliers instead of being aggressive with the clamping
-    # This is more statistically correct
-
+    # Hard clamp at (q1 - 1.5*iqr) and (q3 + 1.5*iqr) to catch
+    # true outliers without being overly aggressive
     for idx in low_indices:
         q3 = np.percentile(dfScaled[:, idx], 75)
         q1 = np.percentile(dfScaled[:, idx], 25)
         iqr = q3 - q1
-
         lower_bound = q1 - 1.5 * iqr
         dfSuppressed[:, idx] = np.maximum(dfSuppressed[:, idx], lower_bound)
     
@@ -520,7 +710,6 @@ def trainingComplete(mineid, debug = 0, k = 8):
         q3 = np.percentile(dfScaled[:, idx], 75)
         q1 = np.percentile(dfScaled[:, idx], 25)
         iqr = q3 - q1
-
         upper_bound = q3 + 1.5 * iqr
         dfSuppressed[:, idx] = np.minimum(dfSuppressed[:, idx], upper_bound) 
     
@@ -528,14 +717,13 @@ def trainingComplete(mineid, debug = 0, k = 8):
 
     for i in range(k):
         cluster_pixels = dfSuppressed[labels == i]
-
         if len(cluster_pixels) == 0:
             centroids_for_meta[i] = centroids[i]  # fallback
         else:
             centroids_for_meta[i] = np.mean(cluster_pixels, axis=0)
 
     # Meta-clustering separates excavated vs non-excavated clusters
-    metaKMeans = KMeans(n_clusters = 2, random_state = 42, n_init = 10)
+    metaKMeans = KMeans(n_clusters=2, random_state=42, n_init=10)
     metaLabels = metaKMeans.fit_predict(centroids_for_meta)
 
     # Identify which metacluster corresponds to excavation
@@ -543,14 +731,9 @@ def trainingComplete(mineid, debug = 0, k = 8):
 
     # ----------------------------------------------------------------
     # CLUSTER PRUNING
-    #
-    # Goal: Retain strong excavation clusters, discard weak / noisy ones
-    # Strategy:
-    # - Identify the strongest excavation cluster
-    # - Keep secondary clusters only if they are sufficiently similar
     # ----------------------------------------------------------------
-    b12_idx = features.index("B12_median")
-    bsi_idx = features.index("BSI_median")
+    b12_idx  = features.index("B12_median")
+    bsi_idx  = features.index("BSI_median")
     ndvi_idx = features.index("NDVI_median")
     ndmi_idx = features.index("NDMI_median")
 
@@ -565,59 +748,45 @@ def trainingComplete(mineid, debug = 0, k = 8):
             - 1.0 * centroids[i][ndmi_idx]
         )
         cluster_scores[i] = score
+    
+    # After the loop, shift all scores so the best is always positive
+    if cluster_scores:
+        min_score = min(cluster_scores.values())
+        if min_score < 0:
+            shift = abs(min_score) + 0.1
+            cluster_scores = {i: s + shift for i, s in cluster_scores.items()}
 
-    # -----------------------------------------
-    # NEW PRUNING: leader-distance based
-    # -----------------------------------------
-
-    # If nothing found (edge case)
     if len(cluster_scores) == 0:
         selected_clusters = set()
     else:
-        # Sort scores
-        scores = list(cluster_scores.values())
-        best_score = max(scores)
-
-        # Distance from leader
-        distances = [best_score - s for s in scores]
-
-        # Robust statistics
-        median_d = np.median(distances)
-        q1 = np.percentile(distances, 25)   
-        q3 = np.percentile(distances, 75)
-        iqr_d = q3 - q1
-
-        # Alpha controls aggressiveness (~1.0–1.5)
-        alpha = 1.0
-
-        # Select clusters
-        selected_clusters = set()
+        scores       = list(cluster_scores.values())
+        best_score   = max(scores)
+        distances    = [best_score - s for s in scores]
+        median_d     = np.median(distances)
+        q1           = np.percentile(distances, 25)
+        q3           = np.percentile(distances, 75)
+        iqr_d        = q3 - q1
+        alpha        = 1.0
 
         for i, s in cluster_scores.items():
             d = best_score - s
-
             if (d <= median_d + alpha * iqr_d) and (s >= 0.6 * best_score):
                 selected_clusters.add(i)
 
-    # -----------------------------------------
-    # FINAL LABEL ASSIGNMENT
-    # -----------------------------------------
-
     final_labels = []
-
     for i in range(k):
         is_mine = False
-
         if i in selected_clusters and metaLabels[i] == exLabel:
-            # Physics constraint (VERY IMPORTANT)
-            if centroids[i][ndvi_idx] <= 0.5:
+            # Physics constraints — must satisfy ALL of these
+            ndvi_ok = centroids[i][ndvi_idx] <= 0.3      # stricter than 0.5
+            bsi_ok  = centroids[i][bsi_idx]  >= 0.0      # BSI must be positive
+            b12_ok  = centroids[i][b12_idx]  >= 0.0      # B12 must be above median
+            if ndvi_ok and bsi_ok and b12_ok:
                 is_mine = True
-
         final_labels.append(1 if is_mine else 0)
 
     best_k = k
 
-    # Persist cluster labels and centroids for monitoring
     metadata = {
         "cluster_labels": {str(i): final_labels[i] for i in range(best_k)},
         "centroids": {
@@ -636,7 +805,7 @@ def trainingComplete(mineid, debug = 0, k = 8):
 
     with open(mainDir + "clusterData.json", "w") as f:
         json.dump(metadata, f, indent=2)
-    
+
 # -------------------------------------------------------------------
 # MONITORING PHASE (Part 1 - Inference in Earth Engine)
 #
@@ -652,16 +821,14 @@ def trainingComplete(mineid, debug = 0, k = 8):
 #   0 -> Non-excavated
 #   2 -> Unknown / masked
 # -------------------------------------------------------------------
-def monitoringStart(startTime, endTime, mineid, windowSize, debug = 0):
+def monitoringStart(startTime, endTime, mineid, windowSize, debug=0):
     mainDir = f"./Mine Data/Mine_{mineid}_data/"
 
-    startTime = ee.Date(startTime)
+    startTime       = ee.Date(startTime)
     actualStartTime = startTime.advance(-windowSize, "day")
 
-    # Convert mine polygon to Earth Engine geometry
     mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
 
-    # Load and preprocess Sentinel-2 imagery
     s2 = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterDate(actualStartTime, endTime)
@@ -669,19 +836,14 @@ def monitoringStart(startTime, endTime, mineid, windowSize, debug = 0):
         .map(mask)
     )
 
-    # Apply identical feature engineering as training
     s2 = featureEngineering(s2, windowSize).filterDate(startTime, endTime)
 
     # ----------------------------------------------------------------
     # MANUAL SCALING IN EARTH ENGINE
-    #
-    # Earth Engine does not support sklearn,
-    # so we manually re-implement RobustScaler using
-    # the learned center_ and scale_ parameters.
     # ----------------------------------------------------------------
     scaler = joblib.load(mainDir + "scaler.pkl")
-    means = scaler.center_.tolist()
-    stds = scaler.scale_.copy()
+    means  = scaler.center_.tolist()
+    stds   = scaler.scale_.copy()
     stds[stds == 0] = 1.0
     stds = stds.tolist()
 
@@ -690,9 +852,6 @@ def monitoringStart(startTime, endTime, mineid, windowSize, debug = 0):
 
     # ----------------------------------------------------------------
     # MANUAL KMEANS ASSIGNMENT IN EARTH ENGINE
-    #
-    # We compute distance to each centroid explicitly
-    # and assign the nearest cluster.
     # ----------------------------------------------------------------
     kmeans = joblib.load(mainDir + "kmeans.pkl")
     centroids = kmeans.cluster_centers_.tolist()
@@ -701,32 +860,21 @@ def monitoringStart(startTime, endTime, mineid, windowSize, debug = 0):
         clusterData = json.load(f)
 
     clusterLabels = clusterData["cluster_labels"]
-    exMaskCreate = kmeansEE(centroids, clusterLabels)
+    exMaskCreate  = kmeansEE(centroids, clusterLabels)
     s2 = s2.map(exMaskCreate)
 
-    # Morphological cleanup:
-    # Opening removes isolated false positives
-    # Closing fills small holes inside excavation regions
     s2 = s2.map(postprocessing)
-
-    # Ensure temporal ordering
     s2 = s2.sort("system:time_start")
-
-    # Assign value 2 to masked pixels (unknown state)
     s2 = s2.map(lambda img: img.unmask(2))
-
-    # Convert ImageCollection -> single Image with one band per date
-    # This preserves full temporal information in one GeoTIFF
     s2 = s2.toBands().clip(mine)
 
-    # Export the result for offline analysis
     task = ee.batch.Export.image.toDrive(
-        image = s2,
-        description = f"mine_{mineid}_excavation_{debug}",
-        fileNamePrefix = f"mine_{mineid}_excavation_{debug}",
-        region = mine.geometry(),
-        scale = 10,
-        maxPixels = 1e13
+        image=s2,
+        description=f"mine_{mineid}_excavation_{debug}",
+        fileNamePrefix=f"mine_{mineid}_excavation_{debug}",
+        region=mine.geometry(),
+        scale=10,
+        maxPixels=1e13
     )
     task.start()
 
@@ -736,85 +884,99 @@ def monitoringStart(startTime, endTime, mineid, windowSize, debug = 0):
 # This function:
 # 1. Loads exported GeoTIFF(s)
 # 2. Merges overlapping tiles per day
-# 3. Builds a temporal confidence system
-# 4. Produces final excavation timelines and visualizations
-# 5. Generates no-go zone alerts if applicable
+# 3. SAR gap-fill: fills cloud-masked periods using Sentinel-1
+# 4. Builds a temporal confidence system
+# 5. Produces final excavation timelines and visualizations
+# 6. Generates no-go zone alerts if applicable
+#
+# SAR gap-fill is injected after retrieveDates() and before
+# confidenceSystem() — the single point where cloud gaps exist
+# as contiguous blocks of 2s in the Efixed array.
+#
+# sar_debug: pass the debug suffix used in sarMonitoringStart().
+#            Set to None to skip SAR gap-fill entirely.
+# sar_consecutive: number of SAR passes that must agree before
+#            filling a gap. Default=2. Increase to 3 if candidate
+#            area inflates unrealistically during monsoon months.
 # -------------------------------------------------------------------
-def monitoringComplete(mineid, threshold, debug = 0):
+def monitoringComplete(mineid, threshold, debug=0, sar_debug=None, sar_consecutive=2):
     mainDir = f"./Mine Data/Mine_{mineid}_data/"
-    outDir = f"./Mine Data/Mine_{mineid}_data/Outputs/"
+    outDir  = f"./Mine Data/Mine_{mineid}_data/Outputs/"
 
     alert_log_path = os.path.join(outDir, f"mine_{mineid}_alerts.log")
 
-    # Allow processing multiple GeoTIFF chunks if needed
     if isinstance(debug, (int, str)):
         debug_list = [debug]
     else:
         debug_list = list(debug)
 
-    all_E = []
+    all_E    = []
     all_dates = []
     transform = None
-    crs = None
+    crs       = None
 
     # ----------------------------------------------------------------
-    # LOAD AND MERGE RASTERS
-    #
-    # Each band corresponds to a timestamp,
-    # but overlapping Sentinel tiles can produce
-    # multiple bands for the same day.
+    # LOAD AND MERGE S2 RASTERS
     # ----------------------------------------------------------------
     for d in debug_list:
         tif_path = mainDir + f"mine_{mineid}_excavation_{d}.tif"
 
         with rasterio.open(tif_path) as src:
-            E = src.read()
+            E         = src.read()
             bandNames = src.descriptions
 
             if transform is None:
                 transform = src.transform
-                crs = src.crs
+                crs       = src.crs
 
-        # Merge multiple bands from the same date
         Efixed, dates = retrieveDates(bandNames, E)
-
         all_E.append(Efixed)
         all_dates.extend(dates)
 
-    # Load no-go zone polygon if present
     nogo = loadNogo(mineid, crs)
 
     if nogo is not None:
         with open(alert_log_path, "w") as f:
             f.write(f"# Monitoring run started: {datetime.now()}\n")
 
-    # Stack all temporal data
     Efixed = np.concatenate(all_E, axis=0)
 
-    # Sort by time
     sort_idx = np.argsort(all_dates)
-    Efixed = Efixed[sort_idx]
-    dates = [all_dates[i] for i in sort_idx]
+    Efixed   = Efixed[sort_idx]
+    dates    = [all_dates[i] for i in sort_idx]
+
+    # ----------------------------------------------------------------
+    # SAR GAP-FILL
+    #
+    # Only activates where S2 has no valid observation (value == 2).
+    # SAR GeoTIFF must be exported first via sarMonitoringStart().
+    # Pass sar_debug=None to skip this step entirely.
+    # ----------------------------------------------------------------
+    if sar_debug is not None:
+        sar_E, sar_dates = loadSAR(mineid, debug=sar_debug)
+        Efixed_before = Efixed.copy()
+        Efixed = sarGapFill(
+            Efixed, dates,
+            sar_E, sar_dates,
+            consecutive_required=sar_consecutive
+        )
+        # Diagnostic plot: shows how much SAR contributed vs S2
+        SARCoveragePlot(
+            mineid, outDir,
+            dates, Efixed_before, Efixed
+        )
 
     # ----------------------------------------------------------------
     # CONFIDENCE SYSTEM
-    #
-    # Excavation must persist over time.
-    # Single-frame changes are treated as noise.
     # ----------------------------------------------------------------
     confirmed, candidate, confidence, firstSeen = confidenceSystem(
         Efixed, dates, threshold
     )
 
-    # Retro-confirmation removes latency bias:
-    # pixels confirmed later are marked as excavated
-    # starting from their first observed excavation.
     retroConfirmed = retroConfirm(confirmed, firstSeen)
 
     # ----------------------------------------------------------------
     # OUTPUT GENERATION
-    #
-    # Spatial maps, temporal plots, and summaries
     # ----------------------------------------------------------------
     makeSpatialMaps(
         mineid, outDir, dates,
@@ -858,14 +1020,6 @@ def monitoringComplete(mineid, threshold, debug = 0):
         transform, crs, nogo
     )
 
-    # ----------------------------------------------------------------
-    # NO-GO ZONE ALERT SYSTEM
-    #
-    # Alerts are hierarchical:
-    # LEVEL 1 -> candidate intrusion
-    # LEVEL 2 -> confirmed violation
-    # LEVEL 3 -> sustained expansion
-    # ----------------------------------------------------------------
     NoGoAlertSystem(
         mineid, outDir,
         dates, candidate, confirmed,
@@ -880,8 +1034,7 @@ def monitoringComplete(mineid, threshold, debug = 0):
 
     # Debug snapshots at representative times
     for i in [
-        int(round(p/100 * (len(dates)-1)))
+        int(round(p / 100 * (len(dates) - 1)))
         for p in [0, 20, 40, 60, 80, 100]
     ]:
         debugCluster(mineid, i, dates, Efixed)
-    
