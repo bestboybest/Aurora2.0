@@ -643,11 +643,7 @@ def NoGoExcavationTimePlot(
 #   1. Fraction of mine pixels with valid S2 data (not cloud-masked)
 #   2. Fraction filled by SAR gap-fill
 #   3. Fraction still unknown after both sources
-#
-# Use this to:
-#   - Confirm SAR is actually filling gaps during monsoon
-#   - Check if candidate area inflation correlates with SAR-filled periods
-#   - Decide whether to raise sar_consecutive from 2 to 3
+#   (all fractions are relative to total mine pixels)
 #
 # Inputs:
 #   Efixed_before : Efixed BEFORE sarGapFill() (raw S2 only)
@@ -709,6 +705,260 @@ def SARCoveragePlot(mineid, outDir, dates, Efixed_before, Efixed_after):
     df.to_csv(outDir + f"mine_{mineid}_SARCoverage.csv", index=False)
 
     return df
+
+# -------------------------------------------------------------------
+# SAR Histogram Analysis
+#
+# Loads the CSV produced by sarAnalysisStart() and generates a
+# diagnostic figure with two sections:
+#
+#   TOP ROW  — overlaid KDE + histogram for each feature
+#              (VV, VH, VV/VH) with all three classes on one axis.
+#              Makes it immediately obvious whether distributions
+#              separate or overlap.
+#
+#   BOTTOM ROW — same data as box-and-whisker plots with individual
+#                data points (stripplot-style) overlaid, so you can
+#                see spread, outliers, and the current fixed threshold.
+#
+# Classes:
+#   excavated     → confirmed S2 label == 1  (red)
+#   non-excavated → confirmed S2 label == 0  (green)
+#   cloud-masked  → S2 label == 2            (grey, dashed — reference only)
+#
+# Annotations printed on each histogram panel:
+#   • median per class
+#   • Cohen's d between excavated and non-excavated
+#     (effect size — >0.8 = well separated, <0.5 = poor separation)
+#   • current fixed threshold line (VV only: -12 dB)
+#   • mine-specific threshold line if vv_thresh_val is passed in
+#
+# Statistics summary CSV is also written alongside the figure.
+#
+# Parameters:
+#   mineid         : mine index
+#   outDir         : output directory (same as other plots)
+#   debug          : suffix matching sarAnalysisStart() output
+#   vv_thresh_val  : optional mine-specific VV threshold (dB) to
+#                    annotate on the VV panels. Pass the value
+#                    printed by sarMonitoringStart() to compare
+#                    against the old fixed -12 dB rule.
+#   delta_thresh_val: optional mine-specific delta threshold (dB)
+#                    to annotate on the VV_VH_ratio panel.
+# -------------------------------------------------------------------
+def SARHistogramPlot(mineid, outDir, debug=0, vv_thresh_val=None, delta_thresh_val=None):
+    import scipy.stats as stats
+
+    mainDir  = f"./Mine Data/Mine_{mineid}_data/"
+    csv_path = mainDir + f"mine_{mineid}_sar_analysis_{debug}.csv"
+
+    df = pd.read_csv(csv_path).dropna(subset=["VV", "VH", "VV_VH_ratio"])
+
+    SAR_FEATURES = ["VV", "VH", "VV_VH_ratio"]
+    CLASSES      = ["excavated", "non-excavated", "cloud-masked"]
+    COLORS       = {
+        "excavated":     "#d62728",
+        "non-excavated": "#2ca02c",
+        "cloud-masked":  "#aaaaaa",
+    }
+    XLABELS = {
+        "VV":          "VV backscatter (dB)",
+        "VH":          "VH backscatter (dB)",
+        "VV_VH_ratio": "VV − VH (dB, log ratio)",
+    }
+
+    # ---- helpers -------------------------------------------------
+    def cohens_d(a, b):
+        """Effect size between two 1-D arrays."""
+        if len(a) < 2 or len(b) < 2:
+            return np.nan
+        pooled = np.sqrt((np.std(a, ddof=1)**2 + np.std(b, ddof=1)**2) / 2)
+        return (np.mean(a) - np.mean(b)) / pooled if pooled > 0 else np.nan
+
+    def kde_curve(values, ax, color, linestyle="-"):
+        """Overlay a smooth KDE on top of the histogram."""
+        if len(values) < 5:
+            return
+        kde  = stats.gaussian_kde(values, bw_method="silverman")
+        xmin, xmax = ax.get_xlim()
+        xs   = np.linspace(xmin, xmax, 300)
+        ys   = kde(xs)
+        # Scale KDE to match histogram height
+        ax2  = ax.twinx()
+        ax2.plot(xs, ys, color=color, linewidth=2, linestyle=linestyle, alpha=0.9)
+        ax2.set_yticks([])
+        ax2.set_ylim(bottom=0)
+
+    # ---- figure layout -------------------------------------------
+    fig, axes = plt.subplots(
+        nrows=2, ncols=3,
+        figsize=(16, 10),
+        gridspec_kw={"height_ratios": [1.6, 1]}
+    )
+    fig.suptitle(
+        f"Mine {mineid} — SAR Feature Distributions by S2 Pixel Label",
+        fontsize=14, fontweight="bold", y=1.01
+    )
+
+    stats_rows = []
+
+    # ---- TOP ROW: overlaid histograms + KDE ----------------------
+    for col, feat in enumerate(SAR_FEATURES):
+        ax = axes[0][col]
+
+        for cls in CLASSES:
+            vals = df[df["pixel_label"] == cls][feat].dropna().values
+            if len(vals) == 0:
+                continue
+            color     = COLORS[cls]
+            linestyle = "--" if cls == "cloud-masked" else "-"
+            alpha     = 0.35 if cls == "cloud-masked" else 0.55
+
+            ax.hist(
+                vals, bins=60,
+                color=color, alpha=alpha,
+                label=f"{cls} (n={len(vals):,})",
+                density=True, edgecolor="none"
+            )
+            # Median tick
+            med = np.median(vals)
+            ax.axvline(med, color=color, linewidth=1.8,
+                       linestyle=":", alpha=0.9)
+            ax.text(med, ax.get_ylim()[1] * 0.01, f"{med:.1f}",
+                    color=color, fontsize=7, rotation=90,
+                    va="bottom", ha="right")
+
+        # KDE overlays (drawn after so xlim is stable)
+        for cls in CLASSES:
+            vals = df[df["pixel_label"] == cls][feat].dropna().values
+            kde_curve(vals, ax, COLORS[cls],
+                      "--" if cls == "cloud-masked" else "-")
+
+        # Fixed threshold reference (VV only)
+        if feat == "VV":
+            ax.axvline(-12, color="orange", linewidth=1.5,
+                       linestyle="-.", label="fixed −12 dB", zorder=5)
+            if vv_thresh_val is not None:
+                ax.axvline(vv_thresh_val, color="gold", linewidth=1.5,
+                           linestyle="-.", label=f"mine thresh {vv_thresh_val:.1f} dB", zorder=5)
+
+        if feat == "VV_VH_ratio" and delta_thresh_val is not None:
+            ax.axvline(delta_thresh_val, color="gold", linewidth=1.5,
+                       linestyle="-.", label=f"delta thresh +{delta_thresh_val:.1f} dB", zorder=5)
+
+        # Cohen's d annotation
+        ex_vals  = df[df["pixel_label"] == "excavated"][feat].dropna().values
+        non_vals = df[df["pixel_label"] == "non-excavated"][feat].dropna().values
+        d        = cohens_d(ex_vals, non_vals)
+        sep_label = (
+            "well separated" if abs(d) > 0.8
+            else "moderate" if abs(d) > 0.5
+            else "poor separation"
+        )
+        ax.set_title(
+            f"{feat}\nCohen's d = {d:.2f}  ({sep_label})",
+            fontsize=10, fontweight="bold"
+        )
+        ax.set_xlabel(XLABELS[feat], fontsize=9)
+        ax.set_ylabel("Density", fontsize=9)
+        ax.legend(fontsize=7, loc="upper left")
+        ax.tick_params(labelsize=8)
+        ax.grid(alpha=0.25)
+
+        # Collect stats
+        for cls in CLASSES:
+            vals = df[df["pixel_label"] == cls][feat].dropna().values
+            stats_rows.append({
+                "feature": feat, "class": cls,
+                "n": len(vals),
+                "median": round(np.median(vals), 3) if len(vals) else np.nan,
+                "mean":   round(np.mean(vals),   3) if len(vals) else np.nan,
+                "std":    round(np.std(vals),     3) if len(vals) else np.nan,
+                "p5":     round(np.percentile(vals,  5), 3) if len(vals) else np.nan,
+                "p95":    round(np.percentile(vals, 95), 3) if len(vals) else np.nan,
+                "cohens_d_vs_nonex": round(d, 3) if cls == "excavated" else np.nan,
+            })
+
+    # ---- BOTTOM ROW: box plots -----------------------------------
+    for col, feat in enumerate(SAR_FEATURES):
+        ax = axes[1][col]
+
+        plot_data   = []
+        plot_labels = []
+        plot_colors = []
+
+        for cls in CLASSES:
+            vals = df[df["pixel_label"] == cls][feat].dropna().values
+            if len(vals) == 0:
+                continue
+            plot_data.append(vals)
+            plot_labels.append(cls.replace("-", "-\n"))
+            plot_colors.append(COLORS[cls])
+
+        bp = ax.boxplot(
+            plot_data,
+            labels=plot_labels,
+            patch_artist=True,
+            medianprops={"color": "black", "linewidth": 2},
+            flierprops={"marker": ".", "markersize": 2, "alpha": 0.3},
+            widths=0.5
+        )
+        for patch, color in zip(bp["boxes"], plot_colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.55)
+
+        # Strip plot: jittered individual points (capped at 300/class for speed)
+        for i, (vals, color) in enumerate(zip(plot_data, plot_colors), start=1):
+            sample = vals if len(vals) <= 300 else np.random.choice(vals, 300, replace=False)
+            jitter = np.random.uniform(-0.18, 0.18, size=len(sample))
+            ax.scatter(i + jitter, sample, color=color, alpha=0.18,
+                       s=4, zorder=3, linewidths=0)
+
+        # Threshold reference lines
+        if feat == "VV":
+            ax.axhline(-12, color="orange", linewidth=1.4, linestyle="-.",
+                       label="fixed −12 dB")
+            if vv_thresh_val is not None:
+                ax.axhline(vv_thresh_val, color="gold", linewidth=1.4,
+                           linestyle="-.", label=f"mine thresh {vv_thresh_val:.1f}")
+            ax.legend(fontsize=7)
+
+        ax.set_ylabel(XLABELS[feat], fontsize=9)
+        ax.set_title(f"{feat} — box + strip", fontsize=9)
+        ax.tick_params(labelsize=8)
+        ax.grid(axis="y", alpha=0.25)
+
+    plt.tight_layout()
+    out_png = outDir + f"mine_{mineid}_SARHistograms_{debug}.png"
+    plt.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved → {out_png}")
+
+    # ---- Stats CSV -----------------------------------------------
+    stats_df = pd.DataFrame(stats_rows)
+    out_csv  = outDir + f"mine_{mineid}_SARHistograms_{debug}_stats.csv"
+    stats_df.to_csv(out_csv, index=False)
+    print(f"Saved → {out_csv}")
+
+    # ---- Console summary -----------------------------------------
+    print(f"\n{'Feature':<14} {'Class':<18} {'Median':>7} {'Mean':>7} "
+          f"{'Std':>6} {'P5':>7} {'P95':>7} {'N':>7} {'Cohen d':>9}")
+    print("─" * 86)
+    for feat in SAR_FEATURES:
+        for cls in CLASSES:
+            row = stats_df[(stats_df["feature"] == feat) &
+                           (stats_df["class"]   == cls)]
+            if row.empty or row["n"].values[0] == 0:
+                continue
+            r = row.iloc[0]
+            d_str = f"{r['cohens_d_vs_nonex']:>9.2f}" if not np.isnan(r["cohens_d_vs_nonex"]) else "         —"
+            print(f"{feat:<14} {cls:<18} {r['median']:>7.2f} {r['mean']:>7.2f} "
+                  f"{r['std']:>6.2f} {r['p5']:>7.2f} {r['p95']:>7.2f} "
+                  f"{int(r['n']):>7,}{d_str}")
+        print()
+
+    return stats_df
+
 
 def KSelectionPlot(mineid, dir, k_scores):
     plt.figure(figsize=(8, 5))
