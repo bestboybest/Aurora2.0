@@ -516,6 +516,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 MINE_DATA_DIR = "Mine Data"
+STARRED_MINES = [
+    0,
+    502
+]
 
 # HELPER FUNCTIONS
 
@@ -630,12 +634,14 @@ def parse_alerts(log_path):
 def categorize_images(images):
     """Intelligently categorize images into logical groups"""
     categories = {
-        "spatial": [],
-        "progress": [],
-        "area_analysis": [],
-        "growth_metrics": [],
-        "no_go_violations": [],
-        "other": []
+     "spatial": [],
+     "progress": [],
+     "area_analysis": [],
+     "growth_metrics": [],
+     "no_go_violations": [],
+     "sar_analysis": [],
+     "sar_coverage": [],
+     "other": []
     }
     
     for img in images:
@@ -651,9 +657,13 @@ def categorize_images(images):
             categories["area_analysis"].append(img)
         elif any(x in img_lower for x in ["normalized", "growthrate", "firstseen"]):
             categories["growth_metrics"].append(img)
+        elif any(x in img_lower for x in ["sar_histogram", "sar_analysis", "sar_histograms"]):
+            categories["sar_analysis"].append(img)
+        elif any(x in img_lower for x in ["sarcoverage", "sar_coverage"]):
+            categories["sar_coverage"].append(img)
         else:
             categories["other"].append(img)
-    
+            
     return categories
 
 def sort_spatial_maps(images):
@@ -707,11 +717,15 @@ with st.sidebar:
     
     st.markdown("### Mine Selection")
     mine_id = st.selectbox(
-        "Select Mine Site",
-        available_mines,
-        format_func=lambda x: f"Mine Site {x}",
-        help="Choose a mine site to view monitoring data"
-    )
+    "Select Mine Site",
+    available_mines,
+    format_func=lambda x: (
+        f"⭐ Mine Site {x}"
+        if x in STARRED_MINES
+        else f"Mine Site {x}"
+    ),
+    help="Choose a mine site to view monitoring data"
+)
     
     st.session_state.current_mine = mine_id
 
@@ -918,6 +932,34 @@ with tab2:
             display_image_with_style(path, title, caption)
             st.markdown("---")
     
+        # SAR Coverage Section
+    if categories["sar_coverage"]:
+        st.markdown('<div class="section-header">SAR Gap-Fill Coverage Analysis</div>', unsafe_allow_html=True)
+        st.markdown("**Sentinel-1 assisted cloud-gap reconstruction and coverage contribution analysis**")
+        st.markdown("---")
+
+        for img in categories["sar_coverage"]:
+            path = os.path.join(out_dir, img)
+            title = os.path.splitext(img)[0].replace("_", " ").title()
+            caption = f"SAR Coverage Analysis: {img}"
+
+            display_image_with_style(path, title, caption)
+            st.markdown("---")
+
+    # SAR Histogram / Threshold Analysis Section
+    if categories["sar_analysis"]:
+        st.markdown('<div class="section-header">SAR Signal Distribution Analysis</div>', unsafe_allow_html=True)
+        st.markdown("**Backscatter distribution analysis used for adaptive SAR excavation thresholding**")
+        st.markdown("---")
+
+        for img in categories["sar_analysis"]:
+            path = os.path.join(out_dir, img)
+            title = os.path.splitext(img)[0].replace("_", " ").title()
+            caption = f"SAR Threshold Analysis: {img}"
+
+            display_image_with_style(path, title, caption)
+            st.markdown("---")
+    
     # No-Go Violations Section
     if categories["no_go_violations"]:
         st.markdown('<div class="section-header">No-Go Zone Violation Analysis</div>', unsafe_allow_html=True)
@@ -944,8 +986,14 @@ with tab2:
             display_image_with_style(path, title, caption)
             st.markdown("---")
     
-    if not any([categories["area_analysis"], categories["growth_metrics"], 
-                categories["no_go_violations"], categories["other"]]):
+    if not any([
+     categories["area_analysis"],
+     categories["growth_metrics"],
+     categories["sar_analysis"],
+     categories["sar_coverage"],
+     categories["no_go_violations"],
+    categories["other"]
+    ]):
         st.info("No temporal analysis data available for this mine site.")
 
 # TAB 3: DATA TABLES

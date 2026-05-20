@@ -1,4 +1,4 @@
-# Monitoring run started: 2026-04-10 15:33:24.429803
+# Monitoring run started: 2026-05-21 02:35:55.299059
 [2017-04-24] | Mine 0 | LEVEL 1 | CANDIDATE INTRUSION
 Early warning: suspected excavation inside no-go zone.
 Affected area: 2700.0 m²
@@ -26,6 +26,10 @@ Affected area: 900.0 m²
 [2021-06-27] | Mine 0 | LEVEL 1 | CANDIDATE INTRUSION
 Early warning: suspected excavation inside no-go zone.
 Affected area: 200.0 m²
+
+[2023-07-27] | Mine 0 | LEVEL 1 | CANDIDATE INTRUSION
+Early warning: suspected excavation inside no-go zone.
+Affected area: 1100.0 m²
 
 [2024-01-18] | Mine 0 | LEVEL 1 | CANDIDATE INTRUSION
 Early warning: suspected excavation inside no-go zone.

@@ -341,7 +341,7 @@ def sarMonitoringStart(startTime, endTime, mineid, debug=0, baseline_days=60):
     vv_thresh_val    = -12.0   # absolute VV threshold (dB)
     delta_thresh_val =   2.0   # delta VV threshold (dB above baseline)
 
-    tif_path = mainDir + f"mine_{mineid}_excavation_0.tif"
+    tif_path = mainDir + f"mine_{mineid}_excavation_{debug}.tif"
     if os.path.exists(tif_path):
         with rasterio.open(tif_path) as src:
             E         = src.read()          # (T, H, W)  values 0/1/2
@@ -505,7 +505,25 @@ def sarMonitoringStart(startTime, endTime, mineid, debug=0, baseline_days=60):
         .map(classifySAR)
         .sort("system:time_start")
     )
-    sar = sar.toBands().clip(mine)
+    
+    reference = (
+    ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(mine)
+    .first()
+    .select("B2")
+    )
+
+    proj = reference.projection()
+
+    sar = (
+        sar
+        .toBands()
+        .reproject(
+            crs=proj.crs(),
+            scale=10
+        )
+        .clip(mine)
+    )
 
     task = ee.batch.Export.image.toDrive(
         image=sar,
@@ -723,6 +741,315 @@ def loadNogo(mineid, crs=None):
         nogo = nogo.to_crs(crs)
 
     return nogo
+
+
+# -------------------------------------------------------------------
+# SAR ANALYSIS — Phase 1: Export SAR values for labelled S2 pixels
+#
+# This function is the FIRST STEP before building any dynamic SAR
+# threshold. It lets you verify whether SAR signals (VV, VH, VV/VH)
+# actually differ between excavated and non-excavated pixels.
+#
+# What it does:
+#   1. Loads the S2 excavation GeoTIFF already produced by
+#      monitoringStart() (values: 1=excavated, 0=non-excavated, 2=masked)
+#   2. For each S2 date, finds the closest Sentinel-1 pass (within
+#      max_sar_gap_days) for that mine
+#   3. Samples VV and VH values from those SAR images at pixels that
+#      are labelled 1 or 0 in S2
+#   4. Exports a CSV with columns:
+#        date, pixel_label, VV, VH, VV_VH_ratio
+#      where pixel_label is:
+#        "excavated"    → S2 said 1
+#        "non-excavated"→ S2 said 0
+#        "cloud-masked" → S2 said 2 (SAR values recorded anyway)
+#
+# Usage:
+#   sarAnalysisStart("2023-01-01", "2023-12-31", mineid=0, s2_debug=0)
+#   # Wait for the EE task to complete, then:
+#   sarAnalysisPlot(mineid=0)
+#
+# Parameters:
+#   startTime / endTime : monitoring period (same as monitoringStart)
+#   mineid              : mine index
+#   s2_debug            : the debug suffix used in monitoringStart()
+#                         so we load the right GeoTIFF
+#   max_sar_gap_days    : SAR pass is used only if within this many
+#                         days of the S2 date (default 6 = S1 revisit)
+#   max_pixels_per_class: cap on how many pixels to sample per class
+#                         per date to keep CSV size manageable
+#   debug               : suffix for the output CSV filename
+# -------------------------------------------------------------------
+def sarAnalysisStart(
+    startTime, endTime, mineid,
+    s2_debug=0,
+    max_sar_gap_days=6,
+    max_pixels_per_class=500,
+    debug=0
+):
+    import rasterio
+    import numpy as np
+    import random
+
+    mainDir = f"./Mine Data/Mine_{mineid}_data/"
+    tif_path = mainDir + f"mine_{mineid}_excavation_{s2_debug}.tif"
+
+    mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
+
+    # ------------------------------------------------------------------
+    # Load the S2 labels (GeoTIFF produced by monitoringStart)
+    # ------------------------------------------------------------------
+    with rasterio.open(tif_path) as src:
+        E         = src.read()           # shape: (T, H, W)
+        bandNames = list(src.descriptions)
+        transform = src.transform
+        crs_wkt   = src.crs.to_wkt()
+
+    # Parse dates from band names (same format as retrieveDates)
+    s2_dates = []
+    for name in bandNames:
+        date_str = name.split("T")[0]
+        s2_dates.append(datetime.strptime(date_str, "%Y%m%d").date())
+
+    # ------------------------------------------------------------------
+    # Load ALL Sentinel-1 imagery for the mine in the date range
+    # We keep VV and VH, apply the same speckle filter as classifySAR
+    # ------------------------------------------------------------------
+    sar = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterDate(startTime, endTime)
+        .filterBounds(mine)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+        .select(["VV", "VH"])
+    )
+
+    def smoothSAR(image):
+        vv = image.select("VV").focalMean(3, "square", "pixels").rename("VV")
+        vh = image.select("VH").focalMean(3, "square", "pixels").rename("VH")
+        ratio = vv.subtract(vh).rename("VV_VH_ratio")   # dB difference ≡ log ratio
+        return (
+            ee.Image.cat([vv, vh, ratio])
+            .copyProperties(image, ["system:time_start"])
+        )
+
+    sar = sar.map(smoothSAR)
+
+    # Retrieve SAR dates from EE (we need to match them to S2 dates client-side)
+    sar_dates_info = sar.aggregate_array("system:time_start").getInfo()
+    sar_dates = [
+        datetime.utcfromtimestamp(ms / 1000).date()
+        for ms in sar_dates_info
+    ]
+    sar_list = sar.toList(sar.size())
+
+    # ------------------------------------------------------------------
+    # Helper: convert raster (row, col) → lon/lat using the GeoTIFF
+    # transform so we can create EE point samples
+    # ------------------------------------------------------------------
+    import rasterio.transform as rio_transform
+
+    def rc_to_lonlat(row, col, transform):
+        lon, lat = rio_transform.xy(transform, row, col, offset="center")
+        return lon, lat
+
+    # ------------------------------------------------------------------
+    # For each S2 date, find the nearest SAR pass and sample pixels
+    # ------------------------------------------------------------------
+    all_records = []
+
+    for t, s2_date in enumerate(s2_dates):
+        label_map = E[t]   # (H, W), values 0/1/2
+
+        # Find closest SAR pass
+        closest_sar_idx = None
+        closest_gap     = 9999
+        for i, sd in enumerate(sar_dates):
+            gap = abs((s2_date - sd).days)
+            if gap <= max_sar_gap_days and gap < closest_gap:
+                closest_gap     = gap
+                closest_sar_idx = i
+
+        if closest_sar_idx is None:
+            # No SAR pass close enough — skip this S2 date
+            continue
+
+        sar_image = ee.Image(sar_list.get(closest_sar_idx))
+
+        # Collect pixel positions for each class
+        rows_ex,  cols_ex  = np.where(label_map == 1)
+        rows_non, cols_non = np.where(label_map == 0)
+        rows_cld, cols_cld = np.where(label_map == 2)
+
+        # Cap to avoid GEE quota issues
+        def sample_indices(rows, cols, cap):
+            idx = list(range(len(rows)))
+            if len(idx) > cap:
+                idx = random.sample(idx, cap)
+            return rows[idx], cols[idx]
+
+        rows_ex,  cols_ex  = sample_indices(rows_ex,  cols_ex,  max_pixels_per_class)
+        rows_non, cols_non = sample_indices(rows_non, cols_non, max_pixels_per_class)
+        rows_cld, cols_cld = sample_indices(rows_cld, cols_cld, max_pixels_per_class // 4)
+
+        class_pixels = [
+            ("excavated",     rows_ex,  cols_ex),
+            ("non-excavated", rows_non, cols_non),
+            ("cloud-masked",  rows_cld, cols_cld),
+        ]
+
+        for label_name, rows, cols in class_pixels:
+            if len(rows) == 0:
+                continue
+
+            # Build an EE FeatureCollection of point geometries
+            points = [
+                ee.Feature(
+                    ee.Geometry.Point(rc_to_lonlat(r, c, transform))
+                )
+                for r, c in zip(rows.tolist(), cols.tolist())
+            ]
+            fc = ee.FeatureCollection(points)
+
+            # Sample SAR values at those points
+            sampled = sar_image.sampleRegions(
+                collection=fc,
+                scale=10,
+                geometries=False
+            )
+
+            records = sampled.getInfo()["features"]
+            for rec in records:
+                props = rec["properties"]
+                all_records.append({
+                    "date":         s2_date.isoformat(),
+                    "pixel_label":  label_name,
+                    "VV":           props.get("VV"),
+                    "VH":           props.get("VH"),
+                    "VV_VH_ratio":  props.get("VV_VH_ratio"),
+                })
+
+        print(f"  [{t+1}/{len(s2_dates)}] {s2_date} — SAR pass {sar_dates[closest_sar_idx]} "
+              f"(gap {closest_gap}d) — "
+              f"ex:{len(rows_ex)} non:{len(rows_non)} cld:{len(rows_cld)}")
+
+    # ------------------------------------------------------------------
+    # Save the CSV
+    # ------------------------------------------------------------------
+    out_csv = mainDir + f"mine_{mineid}_sar_analysis_{debug}.csv"
+    df_out  = pd.DataFrame(all_records)
+    df_out.dropna(subset=["VV", "VH"], inplace=True)
+    df_out.to_csv(out_csv, index=False)
+    print(f"\nSaved {len(df_out)} pixel records → {out_csv}")
+    return df_out
+
+
+# -------------------------------------------------------------------
+# SAR ANALYSIS — Phase 2: Histogram plots
+#
+# Loads the CSV produced by sarAnalysisStart() and generates 3 × 3
+# overlaid histograms:
+#
+#   Rows    → feature:  VV  |  VH  |  VV/VH ratio
+#   Columns → class:    excavated (red)
+#                       non-excavated (green)
+#                       cloud-masked (grey)
+#
+# Each subplot also prints the class medians so you can eyeball
+# whether a fixed threshold (e.g. VV > -12 dB) is reasonable or
+# whether mine-specific stats would do better.
+#
+# The figure is saved to:
+#   ./Mine Data/Mine_{mineid}_data/Outputs/mine_{mineid}_sar_histograms_{debug}.png
+#
+# Usage:
+#   sarAnalysisPlot(mineid=0)         # loads sar_analysis_0.csv
+#   sarAnalysisPlot(mineid=0, debug=1)
+# -------------------------------------------------------------------
+def sarAnalysisPlot(mineid, debug=0):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    mainDir = f"./Mine Data/Mine_{mineid}_data/"
+    outDir  = f"./Mine Data/Mine_{mineid}_data/Outputs/"
+    os.makedirs(outDir, exist_ok=True)
+
+    csv_path = mainDir + f"mine_{mineid}_sar_analysis_{debug}.csv"
+    df = pd.read_csv(csv_path)
+    df = df.dropna(subset=["VV", "VH", "VV_VH_ratio"])
+
+    features_sar = ["VV", "VH", "VV_VH_ratio"]
+    labels       = ["excavated", "non-excavated", "cloud-masked"]
+    colors       = {"excavated": "#d62728", "non-excavated": "#2ca02c", "cloud-masked": "#7f7f7f"}
+    xlabels      = {
+        "VV":          "VV backscatter (dB)",
+        "VH":          "VH backscatter (dB)",
+        "VV_VH_ratio": "VV − VH (dB)",
+    }
+
+    fig, axes = plt.subplots(
+        nrows=len(features_sar), ncols=len(labels),
+        figsize=(14, 10),
+        sharey=False
+    )
+    fig.suptitle(
+        f"Mine {mineid} — SAR feature distributions by S2 pixel label\n"
+        f"(red=excavated  green=non-excavated  grey=cloud-masked)",
+        fontsize=13, y=1.01
+    )
+
+    for row_idx, feat in enumerate(features_sar):
+        for col_idx, label in enumerate(labels):
+            ax  = axes[row_idx][col_idx]
+            sub = df[df["pixel_label"] == label][feat].dropna()
+
+            if len(sub) == 0:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                        transform=ax.transAxes, color="grey")
+                ax.set_title(f"{label}\n{feat}", fontsize=9)
+                continue
+
+            median_val = sub.median()
+            color      = colors[label]
+
+            ax.hist(sub, bins=60, color=color, alpha=0.75, edgecolor="none")
+            ax.axvline(median_val, color="black", linewidth=1.5,
+                       linestyle="--", label=f"median {median_val:.2f}")
+
+            # Mark the current fixed threshold on VV plots for reference
+            if feat == "VV":
+                ax.axvline(-12, color="orange", linewidth=1.2,
+                           linestyle=":", label="current threshold (−12 dB)")
+
+            ax.set_xlabel(xlabels[feat], fontsize=8)
+            ax.set_ylabel("pixel count",  fontsize=8)
+            ax.set_title(f"{label}  (n={len(sub):,})\nmedian {feat} = {median_val:.2f}",
+                         fontsize=9)
+            ax.legend(fontsize=7)
+            ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    out_png = outDir + f"mine_{mineid}_sar_histograms_{debug}.png"
+    plt.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved histograms → {out_png}")
+
+    # ------------------------------------------------------------------
+    # Print a concise summary table so you can read the numbers directly
+    # ------------------------------------------------------------------
+    print(f"\n{'Feature':<14} {'Class':<18} {'Median':>8} {'Mean':>8} {'Std':>8} {'N':>7}")
+    print("-" * 60)
+    for feat in features_sar:
+        for label in labels:
+            sub = df[df["pixel_label"] == label][feat].dropna()
+            if len(sub) == 0:
+                continue
+            print(f"{feat:<14} {label:<18} {sub.median():>8.2f} {sub.mean():>8.2f} "
+                  f"{sub.std():>8.2f} {len(sub):>7,}")
+        print()
+
+    return df
 
 # -------------------------------------------------------------------
 # TRAINING PHASE (Part 1 - Feature Extraction in Earth Engine)
@@ -1101,20 +1428,50 @@ def monitoringComplete(mineid, threshold, debug=0, sar_debug=None, sar_consecuti
     # Only activates where S2 has no valid observation (value == 2).
     # SAR GeoTIFF must be exported first via sarMonitoringStart().
     # Pass sar_debug=None to skip this step entirely.
-    # ----------------------------------------------------------------
     if sar_debug is not None:
-        sar_E, sar_dates = loadSAR(mineid, debug=sar_debug)
-        Efixed_before = Efixed.copy()
-        Efixed = sarGapFill(
-            Efixed, dates,
-            sar_E, sar_dates,
-            consecutive_required=sar_consecutive
-        )
-        # Diagnostic plot: shows how much SAR contributed vs S2
-        SARCoveragePlot(
-            mineid, outDir,
-            dates, Efixed_before, Efixed
-        )
+
+        if isinstance(sar_debug, (int, str)):
+            sar_debug_list = [sar_debug]
+        else:
+            sar_debug_list = list(sar_debug)
+
+        for sd in sar_debug_list:
+
+            sar_E, sar_dates = loadSAR(mineid, debug=sd)
+
+            if sar_E is None:
+                continue
+
+            Efixed_before = Efixed.copy()
+
+            Efixed = sarGapFill(
+                Efixed,
+                dates,
+                sar_E,
+                sar_dates,
+                consecutive_required=sar_consecutive
+            )
+
+            SARCoveragePlot(
+                mineid,
+                outDir,
+                dates,
+                Efixed_before,
+                Efixed
+            )
+
+            """" sarAnalysisStart(
+                startTime=str(dates[0]),
+                endTime=str(dates[-1]),
+                mineid=mineid,
+                s2_debug=debug_list[0],
+                debug=sd
+            )
+
+            sarAnalysisPlot(
+                mineid=mineid,
+                debug=sd
+            ) """
 
     # ----------------------------------------------------------------
     # CONFIDENCE SYSTEM
@@ -1189,311 +1546,3 @@ def monitoringComplete(mineid, threshold, debug=0, sar_debug=None, sar_consecuti
     ]:
         debugCluster(mineid, i, dates, Efixed)
 
-
-# -------------------------------------------------------------------
-# SAR ANALYSIS — Phase 1: Export SAR values for labelled S2 pixels
-#
-# This function is the FIRST STEP before building any dynamic SAR
-# threshold. It lets you verify whether SAR signals (VV, VH, VV/VH)
-# actually differ between excavated and non-excavated pixels.
-#
-# What it does:
-#   1. Loads the S2 excavation GeoTIFF already produced by
-#      monitoringStart() (values: 1=excavated, 0=non-excavated, 2=masked)
-#   2. For each S2 date, finds the closest Sentinel-1 pass (within
-#      max_sar_gap_days) for that mine
-#   3. Samples VV and VH values from those SAR images at pixels that
-#      are labelled 1 or 0 in S2
-#   4. Exports a CSV with columns:
-#        date, pixel_label, VV, VH, VV_VH_ratio
-#      where pixel_label is:
-#        "excavated"    → S2 said 1
-#        "non-excavated"→ S2 said 0
-#        "cloud-masked" → S2 said 2 (SAR values recorded anyway)
-#
-# Usage:
-#   sarAnalysisStart("2023-01-01", "2023-12-31", mineid=0, s2_debug=0)
-#   # Wait for the EE task to complete, then:
-#   sarAnalysisPlot(mineid=0)
-#
-# Parameters:
-#   startTime / endTime : monitoring period (same as monitoringStart)
-#   mineid              : mine index
-#   s2_debug            : the debug suffix used in monitoringStart()
-#                         so we load the right GeoTIFF
-#   max_sar_gap_days    : SAR pass is used only if within this many
-#                         days of the S2 date (default 6 = S1 revisit)
-#   max_pixels_per_class: cap on how many pixels to sample per class
-#                         per date to keep CSV size manageable
-#   debug               : suffix for the output CSV filename
-# -------------------------------------------------------------------
-def sarAnalysisStart(
-    startTime, endTime, mineid,
-    s2_debug=0,
-    max_sar_gap_days=6,
-    max_pixels_per_class=500,
-    debug=0
-):
-    import rasterio
-    import numpy as np
-    import random
-
-    mainDir = f"./Mine Data/Mine_{mineid}_data/"
-    tif_path = mainDir + f"mine_{mineid}_excavation_{s2_debug}.tif"
-
-    mine = geemap.geopandas_to_ee(gdf[gdf["mine_id"] == mineid])
-
-    # ------------------------------------------------------------------
-    # Load the S2 labels (GeoTIFF produced by monitoringStart)
-    # ------------------------------------------------------------------
-    with rasterio.open(tif_path) as src:
-        E         = src.read()           # shape: (T, H, W)
-        bandNames = list(src.descriptions)
-        transform = src.transform
-        crs_wkt   = src.crs.to_wkt()
-
-    # Parse dates from band names (same format as retrieveDates)
-    s2_dates = []
-    for name in bandNames:
-        date_str = name.split("T")[0]
-        s2_dates.append(datetime.strptime(date_str, "%Y%m%d").date())
-
-    # ------------------------------------------------------------------
-    # Load ALL Sentinel-1 imagery for the mine in the date range
-    # We keep VV and VH, apply the same speckle filter as classifySAR
-    # ------------------------------------------------------------------
-    sar = (
-        ee.ImageCollection("COPERNICUS/S1_GRD")
-        .filterDate(startTime, endTime)
-        .filterBounds(mine)
-        .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
-        .select(["VV", "VH"])
-    )
-
-    def smoothSAR(image):
-        vv = image.select("VV").focalMean(3, "square", "pixels").rename("VV")
-        vh = image.select("VH").focalMean(3, "square", "pixels").rename("VH")
-        ratio = vv.subtract(vh).rename("VV_VH_ratio")   # dB difference ≡ log ratio
-        return (
-            ee.Image.cat([vv, vh, ratio])
-            .copyProperties(image, ["system:time_start"])
-        )
-
-    sar = sar.map(smoothSAR)
-
-    # Retrieve SAR dates from EE (we need to match them to S2 dates client-side)
-    sar_dates_info = sar.aggregate_array("system:time_start").getInfo()
-    sar_dates = [
-        datetime.utcfromtimestamp(ms / 1000).date()
-        for ms in sar_dates_info
-    ]
-    sar_list = sar.toList(sar.size())
-
-    # ------------------------------------------------------------------
-    # Helper: convert raster (row, col) → lon/lat using the GeoTIFF
-    # transform so we can create EE point samples
-    # ------------------------------------------------------------------
-    import rasterio.transform as rio_transform
-
-    def rc_to_lonlat(row, col, transform):
-        lon, lat = rio_transform.xy(transform, row, col, offset="center")
-        return lon, lat
-
-    # ------------------------------------------------------------------
-    # For each S2 date, find the nearest SAR pass and sample pixels
-    # ------------------------------------------------------------------
-    all_records = []
-
-    for t, s2_date in enumerate(s2_dates):
-        label_map = E[t]   # (H, W), values 0/1/2
-
-        # Find closest SAR pass
-        closest_sar_idx = None
-        closest_gap     = 9999
-        for i, sd in enumerate(sar_dates):
-            gap = abs((s2_date - sd).days)
-            if gap <= max_sar_gap_days and gap < closest_gap:
-                closest_gap     = gap
-                closest_sar_idx = i
-
-        if closest_sar_idx is None:
-            # No SAR pass close enough — skip this S2 date
-            continue
-
-        sar_image = ee.Image(sar_list.get(closest_sar_idx))
-
-        # Collect pixel positions for each class
-        rows_ex,  cols_ex  = np.where(label_map == 1)
-        rows_non, cols_non = np.where(label_map == 0)
-        rows_cld, cols_cld = np.where(label_map == 2)
-
-        # Cap to avoid GEE quota issues
-        def sample_indices(rows, cols, cap):
-            idx = list(range(len(rows)))
-            if len(idx) > cap:
-                idx = random.sample(idx, cap)
-            return rows[idx], cols[idx]
-
-        rows_ex,  cols_ex  = sample_indices(rows_ex,  cols_ex,  max_pixels_per_class)
-        rows_non, cols_non = sample_indices(rows_non, cols_non, max_pixels_per_class)
-        rows_cld, cols_cld = sample_indices(rows_cld, cols_cld, max_pixels_per_class // 4)
-
-        class_pixels = [
-            ("excavated",     rows_ex,  cols_ex),
-            ("non-excavated", rows_non, cols_non),
-            ("cloud-masked",  rows_cld, cols_cld),
-        ]
-
-        for label_name, rows, cols in class_pixels:
-            if len(rows) == 0:
-                continue
-
-            # Build an EE FeatureCollection of point geometries
-            points = [
-                ee.Feature(
-                    ee.Geometry.Point(rc_to_lonlat(r, c, transform))
-                )
-                for r, c in zip(rows.tolist(), cols.tolist())
-            ]
-            fc = ee.FeatureCollection(points)
-
-            # Sample SAR values at those points
-            sampled = sar_image.sampleRegions(
-                collection=fc,
-                scale=10,
-                geometries=False
-            )
-
-            records = sampled.getInfo()["features"]
-            for rec in records:
-                props = rec["properties"]
-                all_records.append({
-                    "date":         s2_date.isoformat(),
-                    "pixel_label":  label_name,
-                    "VV":           props.get("VV"),
-                    "VH":           props.get("VH"),
-                    "VV_VH_ratio":  props.get("VV_VH_ratio"),
-                })
-
-        print(f"  [{t+1}/{len(s2_dates)}] {s2_date} — SAR pass {sar_dates[closest_sar_idx]} "
-              f"(gap {closest_gap}d) — "
-              f"ex:{len(rows_ex)} non:{len(rows_non)} cld:{len(rows_cld)}")
-
-    # ------------------------------------------------------------------
-    # Save the CSV
-    # ------------------------------------------------------------------
-    out_csv = mainDir + f"mine_{mineid}_sar_analysis_{debug}.csv"
-    df_out  = pd.DataFrame(all_records)
-    df_out.dropna(subset=["VV", "VH"], inplace=True)
-    df_out.to_csv(out_csv, index=False)
-    print(f"\nSaved {len(df_out)} pixel records → {out_csv}")
-    return df_out
-
-
-# -------------------------------------------------------------------
-# SAR ANALYSIS — Phase 2: Histogram plots
-#
-# Loads the CSV produced by sarAnalysisStart() and generates 3 × 3
-# overlaid histograms:
-#
-#   Rows    → feature:  VV  |  VH  |  VV/VH ratio
-#   Columns → class:    excavated (red)
-#                       non-excavated (green)
-#                       cloud-masked (grey)
-#
-# Each subplot also prints the class medians so you can eyeball
-# whether a fixed threshold (e.g. VV > -12 dB) is reasonable or
-# whether mine-specific stats would do better.
-#
-# The figure is saved to:
-#   ./Mine Data/Mine_{mineid}_data/Outputs/mine_{mineid}_sar_histograms_{debug}.png
-#
-# Usage:
-#   sarAnalysisPlot(mineid=0)         # loads sar_analysis_0.csv
-#   sarAnalysisPlot(mineid=0, debug=1)
-# -------------------------------------------------------------------
-def sarAnalysisPlot(mineid, debug=0):
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-
-    mainDir = f"./Mine Data/Mine_{mineid}_data/"
-    outDir  = f"./Mine Data/Mine_{mineid}_data/Outputs/"
-    os.makedirs(outDir, exist_ok=True)
-
-    csv_path = mainDir + f"mine_{mineid}_sar_analysis_{debug}.csv"
-    df = pd.read_csv(csv_path)
-    df = df.dropna(subset=["VV", "VH", "VV_VH_ratio"])
-
-    features_sar = ["VV", "VH", "VV_VH_ratio"]
-    labels       = ["excavated", "non-excavated", "cloud-masked"]
-    colors       = {"excavated": "#d62728", "non-excavated": "#2ca02c", "cloud-masked": "#7f7f7f"}
-    xlabels      = {
-        "VV":          "VV backscatter (dB)",
-        "VH":          "VH backscatter (dB)",
-        "VV_VH_ratio": "VV − VH (dB)",
-    }
-
-    fig, axes = plt.subplots(
-        nrows=len(features_sar), ncols=len(labels),
-        figsize=(14, 10),
-        sharey=False
-    )
-    fig.suptitle(
-        f"Mine {mineid} — SAR feature distributions by S2 pixel label\n"
-        f"(red=excavated  green=non-excavated  grey=cloud-masked)",
-        fontsize=13, y=1.01
-    )
-
-    for row_idx, feat in enumerate(features_sar):
-        for col_idx, label in enumerate(labels):
-            ax  = axes[row_idx][col_idx]
-            sub = df[df["pixel_label"] == label][feat].dropna()
-
-            if len(sub) == 0:
-                ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                        transform=ax.transAxes, color="grey")
-                ax.set_title(f"{label}\n{feat}", fontsize=9)
-                continue
-
-            median_val = sub.median()
-            color      = colors[label]
-
-            ax.hist(sub, bins=60, color=color, alpha=0.75, edgecolor="none")
-            ax.axvline(median_val, color="black", linewidth=1.5,
-                       linestyle="--", label=f"median {median_val:.2f}")
-
-            # Mark the current fixed threshold on VV plots for reference
-            if feat == "VV":
-                ax.axvline(-12, color="orange", linewidth=1.2,
-                           linestyle=":", label="current threshold (−12 dB)")
-
-            ax.set_xlabel(xlabels[feat], fontsize=8)
-            ax.set_ylabel("pixel count",  fontsize=8)
-            ax.set_title(f"{label}  (n={len(sub):,})\nmedian {feat} = {median_val:.2f}",
-                         fontsize=9)
-            ax.legend(fontsize=7)
-            ax.tick_params(labelsize=7)
-
-    plt.tight_layout()
-    out_png = outDir + f"mine_{mineid}_sar_histograms_{debug}.png"
-    plt.savefig(out_png, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved histograms → {out_png}")
-
-    # ------------------------------------------------------------------
-    # Print a concise summary table so you can read the numbers directly
-    # ------------------------------------------------------------------
-    print(f"\n{'Feature':<14} {'Class':<18} {'Median':>8} {'Mean':>8} {'Std':>8} {'N':>7}")
-    print("-" * 60)
-    for feat in features_sar:
-        for label in labels:
-            sub = df[df["pixel_label"] == label][feat].dropna()
-            if len(sub) == 0:
-                continue
-            print(f"{feat:<14} {label:<18} {sub.median():>8.2f} {sub.mean():>8.2f} "
-                  f"{sub.std():>8.2f} {len(sub):>7,}")
-        print()
-
-    return df

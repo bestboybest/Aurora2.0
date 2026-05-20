@@ -1,145 +1,292 @@
 # AURORA 2.0 – Adaptive Mining Activity Monitoring
 
-**Sentinel-2 Time Series | Google Earth Engine | Unsupervised Learning | Streamlit Dashboard**
+Sentinel-2 + Sentinel-1 SAR Fusion | Google Earth Engine | Streamlit Dashboard
 
 ---
 
 ## Overview
-AURORA 2.0 is an adaptive, mine-specific monitoring system designed to detect and track excavation activity using Sentinel-2 multispectral time-series imagery.
 
-The pipeline is fully unsupervised and learns excavation signatures independently for each mine. This allows it to generalize across diverse mine types, geographies, and seasonal conditions without requiring labeled training data.
+AURORA 2.0 is a mine-adaptive excavation monitoring system using:
 
----
+- Sentinel-2 optical imagery for excavation detection
+- Sentinel-1 SAR imagery for cloud-gap filling
 
-## Key Capabilities
-- **Mine-specific excavation signature learning:** Automatically adapts to local mineralogy and soil types.
-- **Time-resolved excavation detection:** Tracks progress over daily/monthly intervals using a "Confidence System" to filter noise.
-- **No-Go Zone monitoring:** Interactively define restricted zones (e.g., forests, water bodies) and receive hierarchical alerts for intrusions.
-- **Resilient Data Handling:** Capable of processing large, chunked GeoTIFF exports from Earth Engine.
-- **Interactive Dashboard:** Built-in Streamlit UI for visualizing results without writing code.
+The system is fully unsupervised and learns excavation signatures independently for each mine.
 
 ---
 
-## Repository Contents
-- `pipelines.py` – Core logic for training (clustering) and monitoring (inference).
-- `outputs.py` – Visualization generation, plotting, and alert system logic.
-- `dashboard.py` – Interactive Streamlit UI code.
-- `testCode.ipynb` – Notebook for interactively drawing restricted zones.
-- `Mine_Data/` – (User Created) Directory storing per-mine data, trained models (`.pkl`), and outputs.
+# Repository Structure
+
+- `pipelines.py`  
+  Core training, monitoring, SAR fusion, and inference logic.
+
+- `outputs.py`  
+  Plot generation and report exports.
+
+- `ui/app.py`  
+  Streamlit dashboard.
+
+- `testCode.ipynb`  
+  Notebook for drawing No-Go Zones.
+
+- `shpToGJson.ipynb`  
+  Shapefile → GeoJSON conversion utility.
 
 ---
 
-## Inputs & Data Requirements
-1.  **Sentinel-2 Level-2A imagery:** Accessed automatically via the Google Earth Engine Python API.
-2.  **Mine boundary polygons:** A shapefile (`.shp`) containing legal mine extents.
-3.  **No-Go Zone polygons (Optional):** User-defined GeoJSON files created via the provided notebook.
+# Reports & Documentation
+
+## `MidTermReport.pdf`
+Midterm report submitted during the AURORA 2.0 event.
+
+## `EndTermReport.pdf`
+Final endterm report containing the complete pipeline and results.
+
+## `Aurora_2.0_Marauders.pptx`
+Presentation slides used during the final project presentation/demo.
+
+## `Aurora_2.0_Updates.pdf`
+Post-event update document containing SAR integration and other improvements
 
 ---
 
-## Installation & Setup
+# Installation
 
-### 1. Python Environment
-Google Earth Engine authentication is required. Ensure the following packages are installed:
+Install required packages:
 
+```bash
 pip install earthengine-api geemap geopandas rasterio scikit-learn numpy pandas matplotlib joblib leafmap streamlit
+```
 
-### 2. Directory Structure
-You must manually create a directory structure for your specific mine before running the code.
-
-Example for Mine ID `226`:
-# Create the main folder and the outputs subfolder
-mkdir -p "Mine Data/Mine_226_Data/Outputs"
-
-The system expects files to be placed here after downloading them from Google Drive (see Usage below).
+Google Earth Engine authentication is required.
 
 ---
 
-## Usage Workflow
+# Example Folder Structure
 
-The pipeline is split into **Training**, **Monitoring**, and **Analysis (UI)**.
-
-### Phase 1: Training a Mine
-1.  **Run the Export Script:**
-    Call `trainingStart(startTime, endTime, mineid, windowSize)` in your Python environment.
-    * *Action:* This triggers an Export Task in Google Earth Engine.
-2.  **Download Data:**
-    Go to your Google Drive. You will find a CSV file named `mine_226_features_0.csv`.
-3.  **Place File:**
-    Move this CSV into your local folder: `Mine Data/Mine_226_Data/`.
-4.  **Train the Model:**
-    Run `trainingComplete(mineid)`.
-    * *Result:* This saves `kmeans.pkl`, `scaler.pkl`, and `clusterData.json` into the folder.
-
-### Phase 2: Monitoring a Mine
-1.  **Run the Inference Script (Manual Splitting):**
-    For long monitoring periods, GEE may time out. You should run `monitoringStart` multiple times with different `debug` values (and optionally split your time range) to generate separate chunks.
-    * *Example:*
-        `monitoringStart('2020-01-01', '2022-01-01', mineid, window, debug=0)`
-        `monitoringStart('2022-01-01', '2024-01-01', mineid, window, debug=1)`
-    * *Action:* This triggers multiple Export Tasks in GEE.
-
-2.  **Download Data:**
-    Go to your Google Drive. You will find GeoTIFF files like `mine_226_excavation_0.tif`, `mine_226_excavation_1.tif`, etc.
-
-3.  **Place Files:**
-    Move all TIF files into: `Mine Data/Mine_226_Data/`.
-
-4.  **Generate Outputs:**
-    Run `monitoringComplete(mineid, threshold, debug=[0, 1])`.
-    * *Stitching:* The `debug` parameter accepts a list. The system will automatically load, stitch, and sort the data from all provided chunks to create a seamless timeline.
-    * *Result:* All plots, maps, and logs are generated in the `Outputs/` subfolder.
+```text
+Mine Data/
+└── Mine_226_Data/
+    ├── Outputs/
+    ├── clusterData.json
+    ├── kmeans.pkl
+    ├── scaler.pkl
+    ├── mine_226_features_0.csv
+    ├── mine_226_excavation_1.tif
+    ├── mine_226_excavation_7.tif
+    ├── mine_226_excavation_9.tif
+    ├── mine_226_sar_1.tif
+    ├── mine_226_sar_7.tif
+    ├── mine_226_sar_9.tif
+    └── nogozones.geojson
+```
 
 ---
 
-## No-Go Zone Creation (Interactive)
+# Dashboard
 
-To enable alerts for restricted areas, you must manually define them using the provided Jupyter Notebook (`testCode.ipynb`).
+Run the dashboard using:
 
-**Steps:**
-1.  **Open Notebook:** Launch `testCode.ipynb` in Jupyter, and scroll down to find the line that starts with "mineId = " and insert the mineId of the mine you want to generate no go zone polygon for.
-2.  **Load Mine:** The notebook loads the specific mine polygon (e.g., ID 226) and centers the map using `leafmap`.
-3.  **Draw Zones:** Use the polygon drawing tool on the map to outline restricted areas (forest buffers, water bodies).
-4.  **Save:** Run the export cell.
-    * *Result:* This saves `nogozones.geojson` directly to your `Mine Data/Mine_226_Data/` folder.
-
-*Once this file exists, `monitoringComplete` will automatically detect it and generate violation alerts.*
+```bash
+python -m streamlit run ui/app.py
+```
 
 ---
 
-## Dashboard (User Interface)
+# Dashboard Features
 
-AURORA 2.0 includes a Streamlit-based dashboard to visualize results without touching code.
-
-**How to Run:**
-1.  Open your terminal.
-2.  Navigate to the project root.
-3.  Run the following command:
-    python -m streamlit run ui/app.py
-
-**Features:**
-- **Mine Selector:** Automatically detects all available mine folders in `Mine Data/`.
-- **Gallery:** Browses generated maps and plots (Spatial Maps, Growth Rates, Confidence Heatmaps).
-- **Data Viewer:** Allows viewing and downloading of generated CSV reports (Alert Logs, Excavation Intensity).
+- Mine selector
+- Spatial excavation maps
+- Confidence heatmaps
+- SAR analysis plots
+- Area vs Time plots
+- Alert logs
+- CSV report viewer
 
 ---
 
-## Limitations (Technical)
+# ⭐ Starred Mines
 
-1.  **Resolution Constraints (10m):** Sentinel-2 has a 10m spatial resolution. Small-scale illegal digging or single-truck operations (<100m²) may be mixed with background signals and go undetected.
-2.  **Spectral Mimicry:** Deep open-pit shadows can spectrally resemble water bodies (low SWIR). While the clustering logic minimizes this, extreme shadow conditions may still cause transient false positives.
-3.  **Confidence Latency:** The system prioritizes precision over speed. A pixel must be excavated for a sustained period (e.g., 30 days) to trigger a "Confirmed" status. This introduces a purposeful delay to filter out cloud artifacts.
-4.  **Optical Blindness:** The system relies on optical imagery. During extended monsoon periods with 100% cloud cover, the system cannot update the excavation status until the sky clears.
+Some mines appear with a ⭐ in the dropdown.
+
+These are mines that are fully updated and contain:
+- latest SAR integration
+- latest outputs
+- latest analysis features
+---
+
+# Workflow
+
+You can use `testCode.ipynb`
+
+## 1) Training
+
+### Export training features
+
+```python
+pipelines.trainingStart(
+    "2020-01-01",
+    "2022-01-01",
+    226,
+    60,
+    debug=0
+)
+```
+
+Download the exported CSV from Google Drive and place it inside:
+
+```text
+Mine Data/Mine_226_Data/
+```
+
+### Train the model
+
+```python
+pipelines.trainingComplete(226, debug=0)
+```
+
+This generates:
+- `kmeans.pkl`
+- `scaler.pkl`
+- `clusterData.json`
 
 ---
 
-## Future Scope
+## 2) Optical Monitoring (Sentinel-2)
 
-1.  **SAR Fusion (Sentinel-1):** Integrating Synthetic Aperture Radar (SAR) would enable "all-weather" monitoring, allowing the system to detect excavation coherence changes even through heavy cloud cover.
-2.  **Semi-Supervised Loop:** The system's "High Confidence" outputs can serve as pseudo-labels to train a lightweight supervised model (e.g., U-Net), progressively improving the decision boundary over time.
-3.  **Dynamic Thresholding:** Instead of a fixed temporal threshold (e.g., 30 days), the system could learn an optimal confidence window per mine based on local cloud statistics and data frequency.
-4.  **Sub-Pixel Unmixing:** Implementing spectral unmixing algorithms to estimate the percentage of excavation within a single 10m pixel, potentially allowing detection of smaller-scale encroachments.
+Large timelines should be split using debug values.
+
+```python
+pipelines.monitoringStart(
+    "2017-01-01",
+    "2022-01-01",
+    226,
+    60,
+    debug=1
+)
+
+pipelines.monitoringStart(
+    "2022-01-01",
+    "2024-01-01",
+    226,
+    60,
+    debug=7
+)
+
+pipelines.monitoringStart(
+    "2024-01-01",
+    "2026-01-01",
+    226,
+    60,
+    debug=9
+)
+```
+
+Download all exported GeoTIFFs and place them inside:
+
+```text
+Mine Data/Mine_226_Data/
+```
 
 ---
 
-## License
-This project is provided for academic and research purposes.
+## 3) SAR Monitoring (Sentinel-1)
+
+Use the SAME debug values as optical monitoring.
+
+```python
+pipelines.sarMonitoringStart(
+    "2017-01-01",
+    "2022-01-01",
+    226,
+    debug=1
+)
+
+pipelines.sarMonitoringStart(
+    "2022-01-01",
+    "2024-01-01",
+    226,
+    debug=7
+)
+
+pipelines.sarMonitoringStart(
+    "2024-01-01",
+    "2026-01-01",
+    226,
+    debug=9
+)
+```
+
+Download all exported SAR GeoTIFFs and place them inside:
+
+```text
+Mine Data/Mine_226_Data/
+```
+
+---
+
+## 4) Final Monitoring + SAR Fusion
+
+```python
+pipelines.monitoringComplete(
+    226,
+    60,
+    debug=[1, 7, 9],
+    sar_debug=[1, 7, 9]
+)
+```
+
+This:
+- stitches monitoring chunks
+- stitches SAR chunks
+- performs SAR-assisted gap filling
+- generates plots
+- generates reports
+- generates alerts
+
+Outputs are saved inside:
+
+```text
+Mine Data/Mine_226_Data/Outputs/
+```
+
+---
+
+# No-Go Zones
+
+Use `testCode.ipynb` to draw restricted regions interactively.
+
+The notebook exports:
+
+```text
+nogozones.geojson
+```
+
+Once present, the monitoring pipeline automatically generates:
+- violation alerts
+- restricted-area overlays
+
+---
+
+# Current Limitations
+
+- Sentinel-2 has 10m spatial resolution
+- SAR is sensitive to moisture and seasonal variation
+- Long monitoring periods require manual chunking
+- Persistent cloud cover still affects optical monitoring quality
+
+---
+
+# Future Scope
+
+- Better seasonal SAR modeling
+- Multi-sensor fusion
+- Semi-supervised refinement
+- Real-time monitoring automation
+- Improved temporal change detection
+
+---
+
+# License
+
+This project is intended for academic and research purposes.
